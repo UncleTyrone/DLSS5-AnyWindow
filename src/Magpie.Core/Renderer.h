@@ -44,6 +44,10 @@ public:
 		return *_frameSource;
 	}
 
+	uint32_t FPS() const noexcept {
+		return _stepTimer.FPS();
+	}
+
 	void OnCursorVisibilityChanged(bool isVisible, bool onDestory);
 
 	void MessageHandler(UINT msg, WPARAM wParam, LPARAM lParam) noexcept;

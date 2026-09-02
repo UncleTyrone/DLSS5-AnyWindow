@@ -206,6 +206,8 @@ struct ScalingOptions {
 	ToolbarState fullscreenInitialToolbarState = ToolbarState::AutoHide;
 	ToolbarState windowedInitialToolbarState = ToolbarState::AutoHide;
 	float initialWindowedScaleFactor = 0.0f;
+	// 为 true 时，窗口模式不在源窗口四周强制预留额外空间，适合原地滤镜。
+	bool exactWindowedSize = false;
 	std::filesystem::path screenshotsDir;
 
 	// 下面的成员支持在缩放时修改

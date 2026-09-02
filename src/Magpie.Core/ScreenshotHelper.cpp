@@ -34,6 +34,10 @@ uint32_t ScreenshotHelper::FindUnusedScreenshotNum(const std::filesystem::path& 
 	wil::unique_hfind hFind(FindFirstFileEx(
 		pattern.c_str(), FindExInfoBasic, &findData, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH));
 	if (!hFind) {
+		// 空目录里没有任何 Magpie_* 文件是正常情况，第一张截图使用 001。
+		if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+			return 1;
+		}
 		Logger::Get().Win32Error("FindFirstFileEx 失败");
 		return 0;
 	}

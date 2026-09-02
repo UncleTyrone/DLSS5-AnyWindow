@@ -70,6 +70,7 @@ void ScalingOptions::Log() const noexcept {
 	duplicateFrameDetectionMode: {}
 	fullscreenInitialToolbarState: {}
 	windowedInitialToolbarState: {}
+	exactWindowedSize: {}
 	screenshotsDir: {}
 	effects: {})",
 		IsWindowedMode(),
@@ -103,6 +104,7 @@ void ScalingOptions::Log() const noexcept {
 		(int)duplicateFrameDetectionMode,
 		(int)fullscreenInitialToolbarState,
 		(int)windowedInitialToolbarState,
+		exactWindowedSize,
 		StrHelper::UTF16ToUTF8(screenshotsDir.native()),
 		LogEffects(effects)
 	));

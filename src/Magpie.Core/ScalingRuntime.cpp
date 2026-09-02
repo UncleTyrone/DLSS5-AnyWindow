@@ -2,6 +2,7 @@
 #include "ScalingRuntime.h"
 #include "CommonSharedConstants.h"
 #include "Logger.h"
+#include "Renderer.h"
 #include "ScalingWindow.h"
 #include "Win32Helper.h"
 #include <dispatcherqueue.h>
@@ -174,6 +175,7 @@ void ScalingRuntime::_ScalingThreadProc() noexcept {
 
 		if (scalingWindow) {
 			_State(ScalingState::Scaling);
+			_fps.store(scalingWindow.Renderer().FPS(), std::memory_order_relaxed);
 
 			const auto now = steady_clock::now();
 			// 限制检测光标移动的频率
@@ -191,6 +193,7 @@ void ScalingRuntime::_ScalingThreadProc() noexcept {
 			const DWORD restMs = DWORD((rest.count() + ratio - 1) / ratio);
 			MsgWaitForMultipleObjectsEx(0, nullptr, restMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 		} else if (scalingWindow.IsSrcRepositioning()) {
+			_fps.store(0, std::memory_order_relaxed);
 			std::optional<bool> repositioning =
 				IsSrcRepositioning(scalingWindow.SrcTracker().Handle());
 			if (repositioning.has_value()) {
@@ -210,6 +213,7 @@ void ScalingRuntime::_ScalingThreadProc() noexcept {
 			}
 		} else {
 			_State(ScalingState::Idle);
+			_fps.store(0, std::memory_order_relaxed);
 			lastRenderTime = {};
 			WaitMessage();
 		}

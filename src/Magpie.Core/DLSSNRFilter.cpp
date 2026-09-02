@@ -7,10 +7,41 @@
 #include "FrameGuidanceD3D12Interop.h"
 #include "FrameGuidancePerformance.h"
 
+#include <atomic>
+
+namespace Magpie {
+
+namespace {
+
+std::atomic<int32_t> g_dlssnrRuntimeState{
+	static_cast<int32_t>(DLSSNRRuntimeState::Pending)
+};
+std::atomic<uint32_t> g_dlssnrEvaluateSuccessCount{ 0 };
+std::atomic<uint32_t> g_dlssnrEvaluateFailureCount{ 0 };
+
+}
+
+void DLSSNRFilter::ResetRuntimeTelemetry() noexcept {
+	g_dlssnrRuntimeState.store(
+		static_cast<int32_t>(DLSSNRRuntimeState::Pending), std::memory_order_relaxed);
+	g_dlssnrEvaluateSuccessCount.store(0, std::memory_order_relaxed);
+	g_dlssnrEvaluateFailureCount.store(0, std::memory_order_relaxed);
+}
+
+DLSSNRTelemetry DLSSNRFilter::RuntimeTelemetry() noexcept {
+	return {
+		.state = static_cast<DLSSNRRuntimeState>(
+			g_dlssnrRuntimeState.load(std::memory_order_relaxed)),
+		.evaluateSuccessCount = g_dlssnrEvaluateSuccessCount.load(std::memory_order_relaxed),
+		.evaluateFailureCount = g_dlssnrEvaluateFailureCount.load(std::memory_order_relaxed)
+	};
+}
+
+}
+
 #ifdef MP_ENABLE_DLSSNR
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
-#include <atomic>
 
 namespace Magpie {
 
@@ -902,9 +933,21 @@ static bool PrepareInput(
 	DLSSNRFilter::Impl& impl,
 	ID3D11Texture2D* input
 ) noexcept {
-	if (!impl.convertInputToRgba) {
+	D3D11_TEXTURE2D_DESC inputDesc{};
+	input->GetDesc(&inputDesc);
+	// The renderer's captured frame can be BGRA, while every DLSSNR output is
+	// RGBA.  Repeated passes feed that RGBA output back as input, so they must
+	// bypass the BGRA conversion shader and copy the previous result directly.
+	if (inputDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
 		impl.context11->CopyResource(impl.sharedInput11.get(), input);
 		return true;
+	}
+	if (inputDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+		!impl.convertInputToRgba || !impl.inputSrv11) {
+		Logger::Get().Error(fmt::format(
+			"Prepare DLSSNR input encountered unsupported format {}",
+			static_cast<uint32_t>(inputDesc.Format)));
+		return false;
 	}
 	ID3D11ShaderResourceView* srv = impl.inputSrv11.get();
 	ID3D11UnorderedAccessView* uav = impl.sharedInputUav11.get();
@@ -953,6 +996,17 @@ bool DLSSNRFilter::Initialize(
 	ID3D11Texture2D* output,
 	const DLSSNRSettings& settings
 ) noexcept {
+	g_dlssnrRuntimeState.store(
+		static_cast<int32_t>(DLSSNRRuntimeState::Pending), std::memory_order_relaxed);
+	struct InitStatusGuard {
+		bool completed = false;
+		~InitStatusGuard() {
+			if (!completed) {
+				g_dlssnrRuntimeState.store(
+					static_cast<int32_t>(DLSSNRRuntimeState::Failed), std::memory_order_relaxed);
+			}
+		}
+	} initStatus;
 	_settings = settings;
 	_impl.reset();
 	FrameGuidancePerformance::ResetDlssnrGpuTiming();
@@ -1206,14 +1260,19 @@ bool DLSSNRFilter::Initialize(
 	LogDlssnrStatus(fmt::format(
 		"DLSSNR STATUS: Feature=18 created=true path={} size={}x{} preset=default(1) "
 		"style={} intensity={} localTone={} localStructure={} guidanceMode={} autoMask={} "
-		"depthInterval={} disabled=false",
+		"depthInterval={} passes={} antiFlicker={} disabled=false",
 		ENABLE_CORE_FEATURE18_DIAGNOSTIC ? "core-diagnostic" : "signed-snippet",
 		impl->width, impl->height, _settings.style,
 		_settings.intensity, _settings.localToneStrength,
 		_settings.localStructureStrength, _settings.guidanceMode,
 		_settings.useAutoMask,
-		_settings.depthInferenceInterval));
+		_settings.depthInferenceInterval,
+		_settings.passes,
+		_settings.antiFlicker));
 	_impl = std::move(impl);
+	initStatus.completed = true;
+	g_dlssnrRuntimeState.store(
+		static_cast<int32_t>(DLSSNRRuntimeState::FeatureCreated), std::memory_order_relaxed);
 	return true;
 }
 
@@ -1256,7 +1315,10 @@ static FrameGuidanceView SelectGuidance(
 	return selected.IsValidFor(context.frameId, extent) ? selected : zero;
 }
 
-bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
+bool DLSSNRFilter::_DrawOnce(
+	const NativeEffectDrawContext& context,
+	bool forceHistoryReset
+) noexcept {
 	if (!_impl || !_impl->feature || !_impl->parameters) {
 		return false;
 	}
@@ -1265,6 +1327,9 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	ID3D11Texture2D* output = context.output;
 	auto fail = [&](std::string_view stage) noexcept {
 		impl.disabled = true;
+		g_dlssnrEvaluateFailureCount.fetch_add(1, std::memory_order_relaxed);
+		g_dlssnrRuntimeState.store(
+			static_cast<int32_t>(DLSSNRRuntimeState::Failed), std::memory_order_relaxed);
 		LogDlssnrStatus(fmt::format(
 			"DLSSNR STATUS: Feature=18 frameId={} stage={} result=internal-failure "
 			"disabled=true fallback=pass-through-next-frame",
@@ -1334,8 +1399,9 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	impl.guidanceInterop->Transition(
 		commandList, D3D12_RESOURCE_STATE_COMMON,
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	const bool guidanceReset = guidance.requiresHistoryReset &&
-		impl.lastGuidanceResetFrameId != context.frameId;
+	const bool guidanceReset = forceHistoryReset ||
+		(guidance.requiresHistoryReset &&
+			impl.lastGuidanceResetFrameId != context.frameId);
 	DWORD sehCode = 0;
 	if (!SetEvaluateParametersSafely(
 		impl, _settings, guidance, guidanceReset, &sehCode)) {
@@ -1371,8 +1437,14 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	const bool evaluateSucceeded = !sehCode && NGXSucceeded(result);
 	if (evaluateSucceeded) {
 		++impl.evaluateSuccessCount;
+		g_dlssnrEvaluateSuccessCount.fetch_add(1, std::memory_order_relaxed);
+		g_dlssnrRuntimeState.store(
+			static_cast<int32_t>(DLSSNRRuntimeState::Evaluating), std::memory_order_relaxed);
 	} else {
 		++impl.evaluateFailureCount;
+		g_dlssnrEvaluateFailureCount.fetch_add(1, std::memory_order_relaxed);
+		g_dlssnrRuntimeState.store(
+			static_cast<int32_t>(DLSSNRRuntimeState::Failed), std::memory_order_relaxed);
 		impl.disabled = true;
 		if (sehCode) {
 			Logger::Get().Error(fmt::format(
@@ -1452,6 +1524,21 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	return true;
 }
 
+bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
+	if (!_DrawOnce(context, _settings.antiFlicker)) return false;
+	for (uint32_t pass = 1; pass < _settings.passes; ++pass) {
+		const NativeEffectDrawContext repeated{
+			.input = context.output,
+			.output = context.output,
+			.frameId = context.frameId,
+			.frameGuidance = context.frameGuidance,
+			.zeroFrameGuidance = context.zeroFrameGuidance
+		};
+		if (!_DrawOnce(repeated)) return false;
+	}
+	return true;
+}
+
 }
 
 #else
@@ -1466,6 +1553,8 @@ DLSSNRFilter::GetFrameGuidanceRequirements() const noexcept { return {}; }
 bool DLSSNRFilter::Initialize(
 	DeviceResources&, ID3D11Texture2D*, ID3D11Texture2D*,
 	const DLSSNRSettings&) noexcept {
+	g_dlssnrRuntimeState.store(
+		static_cast<int32_t>(DLSSNRRuntimeState::Failed), std::memory_order_relaxed);
 	Logger::Get().Error("DLSSNR support is disabled at build time");
 	return false;
 }

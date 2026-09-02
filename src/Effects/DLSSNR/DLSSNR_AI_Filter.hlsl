@@ -61,6 +61,14 @@ int guidanceMode;
 //!STEP 1
 int depthInferenceInterval;
 
+//!PARAMETER
+//!LABEL DLSS5 Passes (1-4 Experimental)
+//!DEFAULT 1
+//!MIN 1
+//!MAX 4
+//!STEP 1
+int passes;
+
 //!TEXTURE
 Texture2D INPUT;
 

@@ -108,8 +108,14 @@ ScalingError ScalingWindow::_StartImpl(HWND hwndSrc) noexcept {
 
 	if (_srcTracker.IsZoomed()) {
 		if (_options.IsWindowedMode()) {
-			Logger::Get().Info("已最大化的窗口不支持窗口模式缩放");
-			return ScalingError::BannedInWindowedMode;
+			// 原地滤镜只覆盖源窗口，不应为了兼容窗口模式而还原或移动最大化窗口。
+			// 仅允许明确请求 exactWindowedSize 且允许最大化的内部启动器走这条路径，
+			// 保持 Magpie 现有普通窗口模式行为不变。
+			if (!_options.exactWindowedSize || !_options.IsAllowScalingMaximized()) {
+				Logger::Get().Info("已最大化的窗口不支持普通窗口模式缩放");
+				return ScalingError::BannedInWindowedMode;
+			}
+			Logger::Get().Info("原地滤镜保持最大化源窗口不变");
 		} else if (!_options.RealIsAllowScalingMaximized()) {
 			Logger::Get().Info("源窗口已最大化");
 			return ScalingError::Maximized;
@@ -204,13 +210,37 @@ ScalingError ScalingWindow::_StartImpl(HWND hwndSrc) noexcept {
 			return ScalingError::InvalidSourceWindow;
 		}
 
-		// 让缩放窗口中心点和源窗口中心点相同
-		_windowRect.left = srcWindowRect.left -
-			(windowWidth - (srcWindowRect.right - srcWindowRect.left)) / 2;
-		_windowRect.top = srcWindowRect.top -
-			(windowHeight - (srcWindowRect.bottom - srcWindowRect.top)) / 2;
-		_windowRect.right = _windowRect.left + windowWidth;
-		_windowRect.bottom = _windowRect.top + windowHeight;
+		if (_options.exactWindowedSize) {
+			// 原地滤镜的渲染矩形必须和被捕获区域逐像素对齐。按非客户区反推
+			// 缩放窗口位置，避免最大化窗口因隐藏边框而出现数像素偏移。
+			const RECT& srcRect = _srcTracker.SrcRect();
+			if (_IsBorderless()) {
+				_windowRect = {
+					srcRect.left - static_cast<LONG>(_nonTopBorderThicknessInClient),
+					srcRect.top - static_cast<LONG>(_topBorderThicknessInClient),
+					srcRect.right + static_cast<LONG>(_nonTopBorderThicknessInClient),
+					srcRect.bottom + static_cast<LONG>(_nonTopBorderThicknessInClient)
+				};
+			} else {
+				RECT frameRect{};
+				AdjustWindowRectExForDpi(
+					&frameRect, WS_OVERLAPPEDWINDOW, FALSE, 0, _currentDpi);
+				_windowRect = {
+					srcRect.left + frameRect.left,
+					srcRect.top - static_cast<LONG>(_topBorderThicknessInClient),
+					srcRect.right + frameRect.right,
+					srcRect.bottom + frameRect.bottom
+				};
+			}
+		} else {
+			// 让缩放窗口中心点和源窗口中心点相同
+			_windowRect.left = srcWindowRect.left -
+				(windowWidth - (srcWindowRect.right - srcWindowRect.left)) / 2;
+			_windowRect.top = srcWindowRect.top -
+				(windowHeight - (srcWindowRect.bottom - srcWindowRect.top)) / 2;
+			_windowRect.right = _windowRect.left + windowWidth;
+			_windowRect.bottom = _windowRect.top + windowHeight;
+		}
 
 		if (Win32Helper::IsWindowHung(_srcTracker.Handle())) {
 			Logger::Get().Error("源窗口已挂起");
@@ -302,12 +332,17 @@ ScalingError ScalingWindow::_StartImpl(HWND hwndSrc) noexcept {
 
 	LogRects(_srcTracker.SrcRect(), _rendererRect, _windowRect);
 
-	if (!_options.RealIsAllowScalingMaximized()) {
+	const bool allowExactWindowFullscreen = _options.IsWindowedMode() &&
+		_options.exactWindowedSize && _options.IsAllowScalingMaximized();
+	if (!_options.RealIsAllowScalingMaximized() && !allowExactWindowFullscreen) {
 		// 检查源窗口是否是无边框全屏窗口
 		if (srcWindowKind == SrcWindowKind::NoNativeFrame && _srcTracker.WindowRect() == _rendererRect) {
 			Logger::Get().Info("源窗口已全屏");
 			return ScalingError::Maximized;
 		}
+	} else if (allowExactWindowFullscreen &&
+		srcWindowKind == SrcWindowKind::NoNativeFrame && _srcTracker.WindowRect() == _rendererRect) {
+		Logger::Get().Info("原地滤镜保持无边框全屏源窗口不变");
 	}
 
 	_renderer = std::make_unique<class Renderer>();
@@ -523,7 +558,7 @@ LRESULT ScalingWindow::_MessageHandler(UINT msg, WPARAM wParam, LPARAM lParam) n
 		_renderer->OnEndResize();
 		_cursorManager->OnEndResizeMove();
 
-		if (!_srcTracker.MoveOnEndResizeMove()) {
+		if (!_options.exactWindowedSize && !_srcTracker.MoveOnEndResizeMove()) {
 			Logger::Get().Error("SrcTracker::MoveOnEndResizeMove 失败");
 			_DelayedStop();
 			return 0;
@@ -938,10 +973,12 @@ bool ScalingWindow::_CalcWindowedScalingWindowSize(int& width, int& height, bool
 
 	// 计算最小尺寸时使用源窗口包含窗口框架的矩形而不是被缩放区域
 	const RECT& srcFrameRect = _srcTracker.WindowFrameRect();
-	const int spaceAround = (int)lroundf(WINDOWED_MODE_MIN_SPACE_AROUND *
-		dpi / float(USER_DEFAULT_SCREEN_DPI));
-	const int minRendererWidth = srcFrameRect.right - srcFrameRect.left + spaceAround;
-	const int minRendererHeight = srcFrameRect.bottom - srcFrameRect.top + spaceAround;
+	const int spaceAround = _options.exactWindowedSize ? 0 :
+		(int)lroundf(WINDOWED_MODE_MIN_SPACE_AROUND * dpi / float(USER_DEFAULT_SCREEN_DPI));
+	const int minRendererWidth = _options.exactWindowedSize ? 0 :
+		srcFrameRect.right - srcFrameRect.left + spaceAround;
+	const int minRendererHeight = _options.exactWindowedSize ? 0 :
+		srcFrameRect.bottom - srcFrameRect.top + spaceAround;
 
 	int xExtraSpace;
 	int yExtraSpace;
@@ -2033,7 +2070,8 @@ void ScalingWindow::_UpdateRendererRect() noexcept {
 		Win32Helper::GetSizeOfRect(oldRendererRect);
 
 	// 全屏模式缩放时不移动源窗口，因为我们不限制最小尺寸，而且源窗口可能处于最大化或全屏状态
-	if (_options.IsWindowedMode() && !_isMovingDueToSrcMoved && !_srcTracker.IsMoving()) {
+	if (_options.IsWindowedMode() && !_options.exactWindowedSize &&
+		!_isMovingDueToSrcMoved && !_srcTracker.IsMoving()) {
 		// 确保源窗口中心点和缩放窗口中心点相同。应先移动源窗口，因为之后需要调整光标位置
 		const RECT& srcRect = _srcTracker.WindowRect();
 		const int offsetX = (_windowRect.left + _windowRect.right - srcRect.left - srcRect.right) / 2;

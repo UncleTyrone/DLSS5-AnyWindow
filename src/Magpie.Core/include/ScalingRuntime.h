@@ -26,6 +26,10 @@ public:
 		return _state.load(std::memory_order_relaxed);
 	}
 
+	uint32_t FPS() const noexcept {
+		return _fps.load(std::memory_order_relaxed);
+	}
+
 	// 调用者应处理线程同步
 	MultithreadEvent<ScalingState> StateChanged;
 
@@ -45,6 +49,7 @@ private:
 	bool _dispatcherInitializedCache = false;
 
 	std::atomic<ScalingState> _state = ScalingState::Idle;
+	std::atomic<uint32_t> _fps = 0;
 };
 
 }

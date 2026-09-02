@@ -11,6 +11,7 @@ public:
 	DeviceResources(DeviceResources&&) = default;
 
 	bool Initialize(bool isForeground) noexcept;
+	bool InitializeOffscreen() noexcept;
 
 	IDXGIFactory7* GetDXGIFactory() const noexcept { return _dxgiFactory.get(); }
 	ID3D11Device5* GetD3DDevice() const noexcept { return _d3dDevice.get(); }

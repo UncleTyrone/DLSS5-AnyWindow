@@ -136,11 +136,30 @@ bool DLSSZeroMVUpscaler::Initialize(
 	}
 	_parameters = parameters;
 
+	const double upscaleRatio = std::max(
+		outputDesc.Width / static_cast<double>(inputDesc.Width),
+		outputDesc.Height / static_cast<double>(inputDesc.Height));
+	const NVSDK_NGX_PerfQuality_Value qualityMode = upscaleRatio >= 2.75 ?
+		NVSDK_NGX_PerfQuality_Value_UltraPerformance :
+		upscaleRatio >= 1.85 ? NVSDK_NGX_PerfQuality_Value_MaxPerf :
+		upscaleRatio >= 1.45 ? NVSDK_NGX_PerfQuality_Value_Balanced :
+		NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	const char* qualityName = qualityMode == NVSDK_NGX_PerfQuality_Value_UltraPerformance ?
+		"UltraPerformance" : qualityMode == NVSDK_NGX_PerfQuality_Value_MaxPerf ?
+		"Performance" : qualityMode == NVSDK_NGX_PerfQuality_Value_Balanced ?
+		"Balanced" : "Quality";
+	const char* presetParameter = qualityMode == NVSDK_NGX_PerfQuality_Value_UltraPerformance ?
+		NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance :
+		qualityMode == NVSDK_NGX_PerfQuality_Value_MaxPerf ?
+		NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance :
+		qualityMode == NVSDK_NGX_PerfQuality_Value_Balanced ?
+		NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced :
+		NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality;
 	// Preset J remains the established default for this captured-frame path.
-	// Real optical flow improves temporal input but is not engine motion.
+	// The performance class follows the actual scale requested by the UI.
 	NVSDK_NGX_Parameter_SetI(
 		parameters,
-		NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+		presetParameter,
 		NVSDK_NGX_DLSS_Hint_Render_Preset_J
 	);
 
@@ -150,7 +169,7 @@ bool DLSSZeroMVUpscaler::Initialize(
 			.InHeight = inputDesc.Height,
 			.InTargetWidth = outputDesc.Width,
 			.InTargetHeight = outputDesc.Height,
-			.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced
+			.InPerfQualityValue = qualityMode
 		},
 		.InFeatureCreateFlags = uint32_t(
 			NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
@@ -170,9 +189,9 @@ bool DLSSZeroMVUpscaler::Initialize(
 	_feature = feature;
 
 	Logger::Get().Info(fmt::format(
-		"DLSS SR_Experimental initialized (Balanced, preset J): {}x{} -> {}x{}, "
+		"DLSS SR_Experimental initialized ({}, preset J): {}x{} -> {}x{}, "
 		"requestedMotion={}, requestedDepth={}, jitter={}",
-		inputDesc.Width, inputDesc.Height, outputDesc.Width, outputDesc.Height,
+		qualityName, inputDesc.Width, inputDesc.Height, outputDesc.Width, outputDesc.Height,
 		_settings.useMotionVectors, _settings.useEstimatedDepth,
 		_settings.enableJitter));
 	return true;
