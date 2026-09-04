@@ -59,6 +59,7 @@ bool FrameGuidanceService::Initialize(
 	ID3D11Texture2D* sourceFrame,
 	const FrameGuidanceRequirements& requirements
 ) noexcept {
+	static_cast<void>(requirements);
 	_resources = &resources;
 	_sourceExtent = GetTextureExtent(sourceFrame);
 	if (!_sourceExtent.IsValid() ||
@@ -83,13 +84,13 @@ bool FrameGuidanceService::Initialize(
 		_zeroMotionProvider.Reset(FrameGuidanceResetReason::ProviderFailure);
 	}
 
+	// Capture has not started yet. The frame-source texture is only an
+	// allocation and its contents are undefined, so the first real capture
+	// must seed every temporal provider.
 	_hasCachedFrame = false;
-	return _Produce({
-		.color = sourceFrame,
-		.frameId = 0,
-		.sourceExtent = _sourceExtent,
-		.validRegion = FrameGuidanceRegion::Full(_sourceExtent)
-	}, requirements).IsValidFor(0, _sourceExtent);
+	_view = {};
+	_zeroView = {};
+	return true;
 }
 
 const FrameGuidanceView& FrameGuidanceService::BeginFrame(
@@ -120,6 +121,7 @@ bool FrameGuidanceService::Resize(
 	FrameGuidanceFrameId currentFrameId,
 	const FrameGuidanceRequirements& requirements
 ) noexcept {
+	static_cast<void>(currentFrameId);
 	if (!sourceExtent.IsValid() || !_resources) {
 		return false;
 	}
@@ -144,11 +146,9 @@ bool FrameGuidanceService::Resize(
 	}
 	_sourceExtent = sourceExtent;
 	_hasCachedFrame = false;
-	return _Produce({
-		.frameId = currentFrameId,
-		.sourceExtent = sourceExtent,
-		.validRegion = FrameGuidanceRegion::Full(sourceExtent)
-	}, requirements).IsValidFor(currentFrameId, sourceExtent);
+	_view = {};
+	_zeroView = {};
+	return true;
 }
 
 void FrameGuidanceService::ResetHistory(

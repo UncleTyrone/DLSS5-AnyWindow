@@ -82,7 +82,9 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 					getParameter("depthInferenceInterval", 4.0f))), 1, 8)),
 			.passes = static_cast<uint32_t>(std::clamp(
 				static_cast<int>(std::lround(getParameter("passes", 1.0f))), 1, 4)),
-			.antiFlicker = getParameter("antiFlicker", 0.0f) >= 0.5f
+			.historyMode = std::clamp(static_cast<int>(std::lround(getParameter(
+				"historyMode",
+				getParameter("antiFlicker", 0.0f) >= 0.5f ? 1.0f : 2.0f))), 0, 2)
 		};
 		auto backend = std::make_unique<DLSSNRFilter>();
 		if (!backend->Initialize(resources, input, output, settings)) {

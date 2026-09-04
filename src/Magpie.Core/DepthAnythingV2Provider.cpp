@@ -122,7 +122,10 @@ void Filter(uint3 tid : SV_DispatchThreadID) {
         return;
     }
     float residual = abs(current - previous);
-    float confidence = HasMotion != 0 ? motionConfidence : 0.0;
+    // Without motion guidance, retain history only where the new inference is
+    // already close to the previous depth. Large residuals still switch to the
+    // current result immediately, limiting trails on moving object boundaries.
+    float confidence = HasMotion != 0 ? motionConfidence : 1.0;
     float historyWeight = (ResetHistory == 0 && inside) ?
         0.85 * confidence * saturate(1.0 - residual * 8.0) : 0.0;
     FilteredDepth[tid.xy] = lerp(current, previous, historyWeight);

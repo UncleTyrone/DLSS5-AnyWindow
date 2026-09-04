@@ -22,6 +22,11 @@
     <EnableDLSSNR>false</EnableDLSSNR>
     <DLSSSdkDir></DLSSSdkDir>
     <DLSSNRRuntimeDir></DLSSNRRuntimeDir>
+    <!-- Optional multi-GPU DLSSNR runtime folders. Each contains nvngx_dlssnr.dll. -->
+    <DLSSNRRuntimeSFV2Dir></DLSSNRRuntimeSFV2Dir>
+    <DLSSNRRuntimeRTX30Dir></DLSSNRRuntimeRTX30Dir>
+    <DLSSNRRuntimeRTX40Dir></DLSSNRRuntimeRTX40Dir>
+    <DLSSNRRuntimeRTX50Dir></DLSSNRRuntimeRTX50Dir>
     <!-- Renderer-owned NVIDIA Optical Flow frame-guidance provider. -->
     <EnableNvidiaOpticalFlow>false</EnableNvidiaOpticalFlow>
     <NvidiaOpticalFlowSdkDir></NvidiaOpticalFlowSdkDir>

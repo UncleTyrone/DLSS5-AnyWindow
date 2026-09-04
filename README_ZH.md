@@ -154,7 +154,7 @@ XeSS 使用跨厂商 D3D12 DP4a 路径，可以在兼容的 Intel、NVIDIA 和 A
 
 如需编译可选后端，请自行新建 `src/BuildOptions.props.user`，并在其中设置功能开关和本机 SDK 路径。该文件已被 `.gitignore` 排除，只用于本机配置，不应提交到公共仓库。
 
-v0.5.6 实验二进制包使用社区修改的 `nvngx_dlssnr.dll` 310.8.0.0，用于 RTX 40 系和 RTX 50 系测试。该 DLL 仅属于 Release 二进制资产，不包含在本源码树或 GitHub 自动生成的源码归档中。由于文件经过修改，其 Authenticode 文件哈希不再匹配 NVIDIA 原始签名。
+v1.7.0 任意窗口源码为 RTX 20、RTX 30、RTX 40 和 RTX 50 提供独立的运行库选择分支。外部 RTX 3090 实机已经确认 RTX 30 分支能够启动并产生可见处理效果。运行库和模型 DLL 仅作为本机构建输入，不包含在本源码树或 GitHub 自动生成的源码归档中。具体范围与限制见 [v1.7.0 发布说明](docs/RELEASE_NOTES_v1.7.0-rtx30-runtime.md)。
 
 原生上采样器和 RTX Video 已统一通过 `NativeEffectBackend` 接口与 `NativeEffectBackendFactory` 分派，将各 SDK 的识别、创建、尺寸调整和绘制逻辑从 Renderer 主路径中移出。帧生成 Presenter 仍保持独立，因为它们需要在最终呈现阶段发布额外帧。
 

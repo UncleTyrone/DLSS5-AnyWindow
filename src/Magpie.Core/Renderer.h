@@ -50,6 +50,8 @@ public:
 
 	void OnCursorVisibilityChanged(bool isVisible, bool onDestory);
 
+	void OnSourceFocusChanged() noexcept;
+
 	void MessageHandler(UINT msg, WPARAM wParam, LPARAM lParam) noexcept;
 
 	const std::vector<const EffectDesc*>& ActiveEffectDescs() const noexcept {
@@ -141,6 +143,7 @@ private:
 	std::unique_ptr<FrameSourceBase> _frameSource;
 	FrameGuidanceService _frameGuidanceService;
 	FrameGuidanceFrameId _capturedFrameId = 0;
+	std::chrono::steady_clock::time_point _lastCapturedFrameTime{};
 	std::vector<EffectDrawer> _effectDrawers;
 	std::vector<std::unique_ptr<class NativeEffectBackend>> _nativeEffectBackends;
 	std::unique_ptr<class DLSSFrameGenerator> _dlssFrameGenerator;

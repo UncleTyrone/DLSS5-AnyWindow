@@ -3,6 +3,7 @@
 #include "DeviceResources.h"
 #include "DirectXHelper.h"
 #include "Logger.h"
+#include "StrHelper.h"
 #include "Win32Helper.h"
 #include "FrameGuidanceD3D12Interop.h"
 #include "FrameGuidancePerformance.h"
@@ -18,6 +19,11 @@ std::atomic<int32_t> g_dlssnrRuntimeState{
 };
 std::atomic<uint32_t> g_dlssnrEvaluateSuccessCount{ 0 };
 std::atomic<uint32_t> g_dlssnrEvaluateFailureCount{ 0 };
+std::atomic<int32_t> g_dlssnrRuntimeKind{
+	static_cast<int32_t>(DLSSNRRuntimeKind::Unknown)
+};
+std::atomic<int32_t> g_dlssnrCudaComputeMajor{ 0 };
+std::atomic<int32_t> g_dlssnrCudaComputeMinor{ 0 };
 
 }
 
@@ -26,6 +32,10 @@ void DLSSNRFilter::ResetRuntimeTelemetry() noexcept {
 		static_cast<int32_t>(DLSSNRRuntimeState::Pending), std::memory_order_relaxed);
 	g_dlssnrEvaluateSuccessCount.store(0, std::memory_order_relaxed);
 	g_dlssnrEvaluateFailureCount.store(0, std::memory_order_relaxed);
+	g_dlssnrRuntimeKind.store(
+		static_cast<int32_t>(DLSSNRRuntimeKind::Unknown), std::memory_order_relaxed);
+	g_dlssnrCudaComputeMajor.store(0, std::memory_order_relaxed);
+	g_dlssnrCudaComputeMinor.store(0, std::memory_order_relaxed);
 }
 
 DLSSNRTelemetry DLSSNRFilter::RuntimeTelemetry() noexcept {
@@ -33,7 +43,11 @@ DLSSNRTelemetry DLSSNRFilter::RuntimeTelemetry() noexcept {
 		.state = static_cast<DLSSNRRuntimeState>(
 			g_dlssnrRuntimeState.load(std::memory_order_relaxed)),
 		.evaluateSuccessCount = g_dlssnrEvaluateSuccessCount.load(std::memory_order_relaxed),
-		.evaluateFailureCount = g_dlssnrEvaluateFailureCount.load(std::memory_order_relaxed)
+		.evaluateFailureCount = g_dlssnrEvaluateFailureCount.load(std::memory_order_relaxed),
+		.runtimeKind = static_cast<DLSSNRRuntimeKind>(
+			g_dlssnrRuntimeKind.load(std::memory_order_relaxed)),
+		.cudaComputeMajor = g_dlssnrCudaComputeMajor.load(std::memory_order_relaxed),
+		.cudaComputeMinor = g_dlssnrCudaComputeMinor.load(std::memory_order_relaxed)
 	};
 }
 
@@ -170,6 +184,235 @@ struct TimingWindow {
 template <typename T>
 T GetExport(HMODULE module, const char* name) noexcept {
 	return reinterpret_cast<T>(GetProcAddress(module, name));
+}
+
+struct CudaComputeCapability {
+	int major = 0;
+	int minor = 0;
+	bool valid = false;
+};
+
+CudaComputeCapability QueryCudaComputeCapability(LUID adapterLuid) noexcept {
+	using CuInitFn = int(__stdcall*)(unsigned int);
+	using CuDeviceGetCountFn = int(__stdcall*)(int*);
+	using CuDeviceGetFn = int(__stdcall*)(int*, int);
+	using CuDeviceGetLuidFn = int(__stdcall*)(char*, unsigned int*, int);
+	using CuDeviceGetAttributeFn = int(__stdcall*)(int*, int, int);
+
+	CudaComputeCapability result;
+	HMODULE module = LoadLibraryExW(
+		L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (!module) return result;
+	auto unload = wil::scope_exit([&]() { FreeLibrary(module); });
+	auto get = [module](const char* name) {
+		return GetProcAddress(module, name);
+	};
+	const auto cuInit = reinterpret_cast<CuInitFn>(get("cuInit"));
+	const auto cuDeviceGetCount = reinterpret_cast<CuDeviceGetCountFn>(
+		get("cuDeviceGetCount"));
+	const auto cuDeviceGet = reinterpret_cast<CuDeviceGetFn>(get("cuDeviceGet"));
+	const auto cuDeviceGetLuid = reinterpret_cast<CuDeviceGetLuidFn>(
+		get("cuDeviceGetLuid"));
+	const auto cuDeviceGetAttribute = reinterpret_cast<CuDeviceGetAttributeFn>(
+		get("cuDeviceGetAttribute"));
+	if (!cuInit || !cuDeviceGetCount || !cuDeviceGet || !cuDeviceGetLuid ||
+		!cuDeviceGetAttribute || cuInit(0) != 0) {
+		return result;
+	}
+
+	int count = 0;
+	if (cuDeviceGetCount(&count) != 0) return result;
+	for (int ordinal = 0; ordinal < count; ++ordinal) {
+		int device = 0;
+		char luid[sizeof(LUID)]{};
+		unsigned int nodeMask = 0;
+		if (cuDeviceGet(&device, ordinal) != 0 ||
+			cuDeviceGetLuid(luid, &nodeMask, device) != 0 ||
+			std::memcmp(luid, &adapterLuid, sizeof(LUID)) != 0) {
+			continue;
+		}
+		// CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR/MINOR.
+		if (cuDeviceGetAttribute(&result.major, 75, device) == 0 &&
+			cuDeviceGetAttribute(&result.minor, 76, device) == 0) {
+			result.valid = true;
+		}
+		break;
+	}
+	return result;
+}
+
+struct DLSSNRRuntimeSelection {
+	std::filesystem::path path;
+	DLSSNRRuntimeKind kind = DLSSNRRuntimeKind::Unknown;
+	CudaComputeCapability cuda;
+	std::wstring adapterName;
+	uint32_t deviceId = 0;
+	bool forced = false;
+};
+
+const char* RuntimeKindName(DLSSNRRuntimeKind kind) noexcept {
+	switch (kind) {
+	case DLSSNRRuntimeKind::ShortFuseFp16: return "310.8.SF-v2 FP16 (RTX 20)";
+	case DLSSNRRuntimeKind::Rtx30Patched: return "310.8.0 RTX30 patch";
+	case DLSSNRRuntimeKind::Rtx40Patched: return "310.8.0 RTX40 patch";
+	case DLSSNRRuntimeKind::Rtx50Original: return "310.8.0 original (RTX 50)";
+	case DLSSNRRuntimeKind::Custom: return "custom override";
+	case DLSSNRRuntimeKind::LegacyRoot: return "legacy root fallback";
+	default: return "unknown";
+	}
+}
+
+std::filesystem::path RuntimePathForKind(
+	const std::filesystem::path& applicationDirectory,
+	DLSSNRRuntimeKind kind
+) {
+	std::filesystem::path directory = applicationDirectory / L"DLSSNR-Runtimes";
+	switch (kind) {
+	case DLSSNRRuntimeKind::ShortFuseFp16:
+		directory /= L"RTX20";
+		if (std::filesystem::is_regular_file(directory / L"nvngx_dlssnr.dll")) {
+			return directory / L"nvngx_dlssnr.dll";
+		}
+		return applicationDirectory / L"DLSSNR-Runtimes" /
+			L"RTX20-30-SF-v2" / L"nvngx_dlssnr.dll";
+	case DLSSNRRuntimeKind::Rtx30Patched:
+		directory /= L"RTX30";
+		if (std::filesystem::is_regular_file(directory / L"nvngx_dlssnr.dll")) {
+			return directory / L"nvngx_dlssnr.dll";
+		}
+		return applicationDirectory / L"DLSSNR-Runtimes" /
+			L"RTX20-30-SF-v2" / L"nvngx_dlssnr.dll";
+	case DLSSNRRuntimeKind::Rtx40Patched:
+		directory /= L"RTX40";
+		break;
+	case DLSSNRRuntimeKind::Rtx50Original:
+		directory /= L"RTX50";
+		break;
+	default:
+		return applicationDirectory / L"nvngx_dlssnr.dll";
+	}
+	return directory / L"nvngx_dlssnr.dll";
+}
+
+DLSSNRRuntimeKind ParseRuntimeOverride(const std::wstring& value) noexcept {
+	if (_wcsicmp(value.c_str(), L"sf-v2") == 0 ||
+		_wcsicmp(value.c_str(), L"rtx20-30") == 0 ||
+		_wcsicmp(value.c_str(), L"rtx20") == 0) {
+		return DLSSNRRuntimeKind::ShortFuseFp16;
+	}
+	if (_wcsicmp(value.c_str(), L"rtx30") == 0) {
+		return DLSSNRRuntimeKind::Rtx30Patched;
+	}
+	if (_wcsicmp(value.c_str(), L"rtx40") == 0) {
+		return DLSSNRRuntimeKind::Rtx40Patched;
+	}
+	if (_wcsicmp(value.c_str(), L"rtx50") == 0 ||
+		_wcsicmp(value.c_str(), L"original") == 0) {
+		return DLSSNRRuntimeKind::Rtx50Original;
+	}
+	return DLSSNRRuntimeKind::Unknown;
+}
+
+DLSSNRRuntimeKind DetectRuntimeKind(
+	std::wstring_view adapterName,
+	const CudaComputeCapability& cuda
+) noexcept {
+	if (adapterName.find(L"RTX 20") != std::wstring_view::npos) {
+		return DLSSNRRuntimeKind::ShortFuseFp16;
+	}
+	if (adapterName.find(L"RTX 30") != std::wstring_view::npos) {
+		return DLSSNRRuntimeKind::Rtx30Patched;
+	}
+	if (adapterName.find(L"RTX 40") != std::wstring_view::npos) {
+		return DLSSNRRuntimeKind::Rtx40Patched;
+	}
+	if (adapterName.find(L"RTX 50") != std::wstring_view::npos) {
+		return DLSSNRRuntimeKind::Rtx50Original;
+	}
+	if (!cuda.valid) return DLSSNRRuntimeKind::Unknown;
+	if (cuda.major == 7) {
+		return DLSSNRRuntimeKind::ShortFuseFp16;
+	}
+	if (cuda.major == 8 && cuda.minor <= 6) {
+		return DLSSNRRuntimeKind::Rtx30Patched;
+	}
+	if (cuda.major == 8 && cuda.minor == 9) {
+		return DLSSNRRuntimeKind::Rtx40Patched;
+	}
+	if (cuda.major >= 12) {
+		return DLSSNRRuntimeKind::Rtx50Original;
+	}
+	return DLSSNRRuntimeKind::Unknown;
+}
+
+DLSSNRRuntimeSelection SelectDLSSNRRuntime(
+	const std::filesystem::path& applicationDirectory,
+	IDXGIAdapter4* adapter
+) noexcept {
+	DLSSNRRuntimeSelection result;
+	DXGI_ADAPTER_DESC3 description{};
+	if (adapter && SUCCEEDED(adapter->GetDesc3(&description))) {
+		result.adapterName = description.Description;
+		result.deviceId = description.DeviceId;
+		if (description.VendorId == 0x10de) {
+			// GeForce names identify the 20/30/40/50 generation without touching
+			// the CUDA driver during renderer initialization. Query CUDA only for
+			// professional/OEM names that do not carry a GeForce generation token.
+			result.kind = DetectRuntimeKind(result.adapterName, result.cuda);
+			if (result.kind == DLSSNRRuntimeKind::Unknown) {
+				result.cuda = QueryCudaComputeCapability(description.AdapterLuid);
+				result.kind = DetectRuntimeKind(result.adapterName, result.cuda);
+			}
+		}
+	}
+
+	std::wstring runtimeOverride(32768, L'\0');
+	const DWORD overrideLength = GetEnvironmentVariableW(
+		L"MAGPIE_DLSSNR_RUNTIME", runtimeOverride.data(),
+		static_cast<DWORD>(runtimeOverride.size()));
+	if (overrideLength && overrideLength < runtimeOverride.size()) {
+		runtimeOverride.resize(overrideLength);
+		if (_wcsicmp(runtimeOverride.c_str(), L"auto") != 0) {
+			result.forced = true;
+			const DLSSNRRuntimeKind forcedKind = ParseRuntimeOverride(runtimeOverride);
+			if (forcedKind != DLSSNRRuntimeKind::Unknown) {
+				result.kind = forcedKind;
+				result.path = RuntimePathForKind(applicationDirectory, result.kind);
+			} else {
+				result.kind = DLSSNRRuntimeKind::Custom;
+				result.path = std::filesystem::path(runtimeOverride);
+				if (result.path.is_relative()) result.path = applicationDirectory / result.path;
+				std::error_code error;
+				if (std::filesystem::is_directory(result.path, error)) {
+					result.path /= L"nvngx_dlssnr.dll";
+				}
+			}
+		}
+	}
+
+	if (result.path.empty()) {
+		if (result.kind != DLSSNRRuntimeKind::Unknown) {
+			result.path = RuntimePathForKind(applicationDirectory, result.kind);
+		} else {
+			result.kind = DLSSNRRuntimeKind::LegacyRoot;
+			result.path = applicationDirectory / L"nvngx_dlssnr.dll";
+		}
+	}
+
+	std::error_code error;
+	if (!result.forced && !std::filesystem::is_regular_file(result.path, error)) {
+		const std::filesystem::path legacyPath =
+			applicationDirectory / L"nvngx_dlssnr.dll";
+		error.clear();
+		if (std::filesystem::is_regular_file(legacyPath, error)) {
+			Logger::Get().Warn(fmt::format(
+				"Selected DLSSNR runtime is missing; using legacy root DLL instead: {}",
+				StrHelper::UTF16ToUTF8(result.path.wstring())));
+			result.kind = DLSSNRRuntimeKind::LegacyRoot;
+			result.path = legacyPath;
+		}
+	}
+	return result;
 }
 
 }
@@ -830,15 +1073,18 @@ static bool SetCreateParametersSafely(
 
 static bool InitializeSignedSnippet(
 	DLSSNRFilter::Impl& impl,
-	const std::filesystem::path& applicationDirectory
+	const std::filesystem::path& applicationDirectory,
+	const std::filesystem::path& dllPath
 ) noexcept {
-	const std::filesystem::path dllPath =
-		applicationDirectory / L"nvngx_dlssnr.dll";
-	impl.snippetModule = LoadLibraryExW(
-		dllPath.c_str(), nullptr,
-		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 	if (!impl.snippetModule) {
-		Logger::Get().Win32Error("Load signed nvngx_dlssnr.dll failed");
+		impl.snippetModule = LoadLibraryExW(
+			dllPath.c_str(), nullptr,
+			LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+	}
+	if (!impl.snippetModule) {
+		Logger::Get().Win32Error(fmt::format(
+			"Load selected nvngx_dlssnr.dll failed: {}",
+			StrHelper::UTF16ToUTF8(dllPath.wstring())));
 		return false;
 	}
 
@@ -1154,11 +1400,46 @@ bool DLSSNRFilter::Initialize(
 
 	const std::filesystem::path applicationDirectory =
 		Win32Helper::GetExePath().parent_path();
-	const std::wstring featurePath = applicationDirectory.wstring();
-	const wchar_t* featurePaths[]{ featurePath.c_str() };
+	const DLSSNRRuntimeSelection runtimeSelection = SelectDLSSNRRuntime(
+		applicationDirectory, resources.GetGraphicsAdapter());
+	g_dlssnrRuntimeKind.store(
+		static_cast<int32_t>(runtimeSelection.kind), std::memory_order_relaxed);
+	g_dlssnrCudaComputeMajor.store(
+		runtimeSelection.cuda.major, std::memory_order_relaxed);
+	g_dlssnrCudaComputeMinor.store(
+		runtimeSelection.cuda.minor, std::memory_order_relaxed);
+	LogDlssnrStatus(fmt::format(
+		"DLSSNR runtime selection: adapter=\"{}\" device={:#x} cuda={}.{} "
+		"mode={} runtime=\"{}\" path=\"{}\"",
+		StrHelper::UTF16ToUTF8(runtimeSelection.adapterName),
+		runtimeSelection.deviceId,
+		runtimeSelection.cuda.major, runtimeSelection.cuda.minor,
+		runtimeSelection.forced ? "forced" : "auto",
+		RuntimeKindName(runtimeSelection.kind),
+		StrHelper::UTF16ToUTF8(runtimeSelection.path.wstring())));
+
+	// Preload the selected module before NGX Core initialization. Windows resolves
+	// already-loaded modules by base name, so this prevents Core from binding a
+	// different nvngx_dlssnr.dll from the application root.
+	impl->snippetModule = LoadLibraryExW(
+		runtimeSelection.path.c_str(), nullptr,
+		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+	if (!impl->snippetModule) {
+		Logger::Get().Win32Error(fmt::format(
+			"Preload selected nvngx_dlssnr.dll failed: {}",
+			StrHelper::UTF16ToUTF8(runtimeSelection.path.wstring())));
+		return false;
+	}
+
+	const std::wstring featurePath = runtimeSelection.path.parent_path().wstring();
+	const std::wstring applicationFeaturePath = applicationDirectory.wstring();
+	std::array<const wchar_t*, 2> featurePaths{
+		featurePath.c_str(), applicationFeaturePath.c_str()
+	};
 	NVSDK_NGX_FeatureCommonInfo featureInfo{};
-	featureInfo.PathListInfo.Path = featurePaths;
-	featureInfo.PathListInfo.Length = 1;
+	featureInfo.PathListInfo.Path = featurePaths.data();
+	featureInfo.PathListInfo.Length =
+		runtimeSelection.path.parent_path() == applicationDirectory ? 1 : 2;
 	DWORD sehCode = 0;
 	NVSDK_NGX_Result result = CallCoreInitSafely(
 		"7c134ab9-9677-4af5-a2b2-bca943350861",
@@ -1180,7 +1461,8 @@ bool DLSSNRFilter::Initialize(
 	impl->coreInitialized = true;
 
 	if constexpr (!ENABLE_CORE_FEATURE18_DIAGNOSTIC) {
-		if (!InitializeSignedSnippet(*impl, applicationDirectory)) return false;
+		if (!InitializeSignedSnippet(
+			*impl, applicationDirectory, runtimeSelection.path)) return false;
 	}
 
 	sehCode = 0;
@@ -1260,7 +1542,7 @@ bool DLSSNRFilter::Initialize(
 	LogDlssnrStatus(fmt::format(
 		"DLSSNR STATUS: Feature=18 created=true path={} size={}x{} preset=default(1) "
 		"style={} intensity={} localTone={} localStructure={} guidanceMode={} autoMask={} "
-		"depthInterval={} passes={} antiFlicker={} disabled=false",
+		"depthInterval={} passes={} historyMode={} disabled=false",
 		ENABLE_CORE_FEATURE18_DIAGNOSTIC ? "core-diagnostic" : "signed-snippet",
 		impl->width, impl->height, _settings.style,
 		_settings.intensity, _settings.localToneStrength,
@@ -1268,7 +1550,7 @@ bool DLSSNRFilter::Initialize(
 		_settings.useAutoMask,
 		_settings.depthInferenceInterval,
 		_settings.passes,
-		_settings.antiFlicker));
+		_settings.historyMode));
 	_impl = std::move(impl);
 	initStatus.completed = true;
 	g_dlssnrRuntimeState.store(
@@ -1525,7 +1807,13 @@ bool DLSSNRFilter::_DrawOnce(
 }
 
 bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
-	if (!_DrawOnce(context, _settings.antiFlicker)) return false;
+	const bool hasUsableMotion = _settings.guidanceMode != 1 &&
+		_settings.guidanceMode != 3 &&
+		context.frameGuidance.motion.metadata.valid &&
+		!context.frameGuidance.motion.metadata.isZero;
+	const bool forceHistoryReset = _settings.historyMode == 1 ||
+		(_settings.historyMode == 0 && !hasUsableMotion);
+	if (!_DrawOnce(context, forceHistoryReset)) return false;
 	for (uint32_t pass = 1; pass < _settings.passes; ++pass) {
 		const NativeEffectDrawContext repeated{
 			.input = context.output,

@@ -2,6 +2,7 @@
 #include "../Magpie.Core/DeviceResources.h"
 #include "../Magpie.Core/DLSSNRFilter.h"
 #include "../Magpie.Core/DLSSZeroMVUpscaler.h"
+#include "../Magpie.Core/HalfResOpticalFlow.h"
 #include "../Magpie.Core/ZeroFrameGuidanceProvider.h"
 #include "../Shared/Logger.h"
 
@@ -87,10 +88,11 @@ float ParseFloat(const wchar_t* value) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-	if (argc != 11 && argc != 12 && argc != 13) {
+	if (argc < 11 || argc > 15) {
 		std::wcerr <<
 			L"Usage: DLSSNROffscreen inputWidth inputHeight outputWidth outputHeight "
-			L"pipeline style intensity tone structure autoMask [passes] [antiFlicker]\n";
+			L"pipeline style intensity tone structure autoMask [passes] [antiFlicker] "
+			L"[guidanceMode] [historyMode]\n";
 		return 2;
 	}
 
@@ -118,12 +120,17 @@ int wmain(int argc, wchar_t** argv) {
 			.localToneStrength = ParseFloat(argv[8]),
 			.localStructureStrength = ParseFloat(argv[9]),
 			.useAutoMask = ParseInt(argv[10], 0, 1) != 0,
-			.guidanceMode = 1,
+			.guidanceMode = argc >= 14 ? ParseInt(argv[13], 0, 3) : 1,
 			.depthInferenceInterval = 4,
 			.passes = argc >= 12 ?
 				static_cast<uint32_t>(ParseInt(argv[11], 1, 4)) : 1u,
-			.antiFlicker = argc == 13 && ParseInt(argv[12], 0, 1) != 0
+			.historyMode = argc >= 15 ? ParseInt(argv[14], 0, 2) :
+				(argc >= 13 ? (ParseInt(argv[12], 0, 1) != 0 ? 1 : 2) : 0)
 		};
+		if (nrSettings.guidanceMode == 3) {
+			throw std::runtime_error(
+				"offscreen diagnostic does not initialize the learned depth provider");
+		}
 
 		_setmode(_fileno(stdin), _O_BINARY);
 		_setmode(_fileno(stdout), _O_BINARY);
@@ -170,11 +177,18 @@ int wmain(int argc, wchar_t** argv) {
 		ZeroFrameGuidanceResources zeroResources;
 		ZeroDepthProvider zeroDepth(zeroResources);
 		ZeroMotionVectorProvider zeroMotion(zeroResources);
+		SoftwareOpticalFlowProvider softwareMotion;
 		const FrameGuidanceExtent outputExtent{ outputWidth, outputHeight };
 		if (useNeuralRender &&
 			(!zeroDepth.Initialize(resources, outputExtent) ||
 			 !zeroMotion.Initialize(resources, outputExtent))) {
 			throw std::runtime_error("zero guidance initialization failed");
+		}
+		const bool useSoftwareMotion = useNeuralRender &&
+			(nrSettings.guidanceMode == 0 || nrSettings.guidanceMode == 2);
+		if (useSoftwareMotion &&
+			!softwareMotion.Initialize(resources, outputExtent)) {
+			throw std::runtime_error("software optical flow initialization failed");
 		}
 
 		DLSSNRFilter nrFilter;
@@ -221,7 +235,8 @@ int wmain(int argc, wchar_t** argv) {
 				DepthProviderOutput depth;
 				MotionVectorProviderOutput motion;
 				if (!zeroDepth.BeginFrame(frame, depth) ||
-					!zeroMotion.BeginFrame(frame, motion)) {
+					!(useSoftwareMotion ? softwareMotion.BeginFrame(frame, motion) :
+						zeroMotion.BeginFrame(frame, motion))) {
 					throw std::runtime_error("zero guidance frame failed");
 				}
 				FrameGuidanceView zero;

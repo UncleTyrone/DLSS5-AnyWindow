@@ -739,6 +739,10 @@
   </Target>
   <Target Name="CopyDLSSNRRuntime" AfterTargets="Build" Condition="$(EnableDLSSNR) And '$(Platform)' == 'x64'">
     <Copy SourceFiles="$(DLSSNRRuntimeDir)\nvngx_dlssnr.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(DLSSNRRuntimeSFV2Dir)\nvngx_dlssnr.dll" DestinationFolder="$(OutDir)\DLSSNR-Runtimes\RTX20" SkipUnchangedFiles="true" Condition="'$(DLSSNRRuntimeSFV2Dir)' != '' And Exists('$(DLSSNRRuntimeSFV2Dir)\nvngx_dlssnr.dll')" />
+    <Copy SourceFiles="$(DLSSNRRuntimeRTX30Dir)\nvngx_dlssnr.dll" DestinationFolder="$(OutDir)\DLSSNR-Runtimes\RTX30" SkipUnchangedFiles="true" Condition="'$(DLSSNRRuntimeRTX30Dir)' != '' And Exists('$(DLSSNRRuntimeRTX30Dir)\nvngx_dlssnr.dll')" />
+    <Copy SourceFiles="$(DLSSNRRuntimeRTX40Dir)\nvngx_dlssnr.dll" DestinationFolder="$(OutDir)\DLSSNR-Runtimes\RTX40" SkipUnchangedFiles="true" Condition="'$(DLSSNRRuntimeRTX40Dir)' != '' And Exists('$(DLSSNRRuntimeRTX40Dir)\nvngx_dlssnr.dll')" />
+    <Copy SourceFiles="$(DLSSNRRuntimeRTX50Dir)\nvngx_dlssnr.dll" DestinationFolder="$(OutDir)\DLSSNR-Runtimes\RTX50" SkipUnchangedFiles="true" Condition="'$(DLSSNRRuntimeRTX50Dir)' != '' And Exists('$(DLSSNRRuntimeRTX50Dir)\nvngx_dlssnr.dll')" />
   </Target>
   <Target Name="CopyFrameGuidanceDepthRuntime" AfterTargets="Build" Condition="$(EnableDepthAnythingV2) And '$(Platform)' == 'x64'">
     <ItemGroup>

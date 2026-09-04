@@ -428,6 +428,7 @@ void ScalingWindow::Render() noexcept {
 	}
 
 	if (srcFocusedChanged) {
+		_renderer->OnSourceFocusChanged();
 		_UpdateFocusStateAsync();
 	}
 

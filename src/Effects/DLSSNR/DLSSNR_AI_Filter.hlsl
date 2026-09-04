@@ -69,6 +69,14 @@ int depthInferenceInterval;
 //!STEP 1
 int passes;
 
+//!PARAMETER
+//!LABEL History Mode (0 Adaptive, 1 Static Stable, 2 Continuous)
+//!DEFAULT 0
+//!MIN 0
+//!MAX 2
+//!STEP 1
+int historyMode;
+
 //!TEXTURE
 Texture2D INPUT;
 

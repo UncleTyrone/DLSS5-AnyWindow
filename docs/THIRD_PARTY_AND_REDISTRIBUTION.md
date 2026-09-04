@@ -30,7 +30,6 @@ This document is an engineering inventory, not legal advice. A component being d
 | ONNX Runtime DirectML | Microsoft-distributed runtime with MIT and bundled third-party notices | Acquire through the pinned NuGet package; do not commit runtime binaries | Ship only the native files permitted by the package terms and include all supplied notices |
 | ONNX Runtime TensorRT, TensorRT, CUDA and cuDNN | Mixed Microsoft/NVIDIA runtime terms | Keep all runtimes local; generate TensorRT engine caches per machine and never commit them | **Internal testing only until every binary's redistribution terms and GPL compatibility are reviewed** |
 | NVIDIA Video Effects / Maxine runtime and models | NVIDIA proprietary and AI-product terms, plus bundled third-party notices | Do not commit wheel, models, SDK, or runtime binaries | **Unresolved/high risk; review the exact runtime/model terms and GPL compatibility before release** |
-| OptiScaler reference checkout | Reference only; not linked into Magpie | Do not copy its source or binaries without a separate review | Not part of the package |
 | Microsoft/Windows redistributable runtime files | Per Microsoft redistribution terms | Do not vendor development SDKs | Ship only files Microsoft marks redistributable and retain required notices |
 
 The controlling texts are the exact license files supplied with each SDK/runtime. The local development cache currently contains, among others:
@@ -46,6 +45,10 @@ The controlling texts are the exact license files supplied with each SDK/runtime
 The community-modified `nvngx_dlssnr.dll` used by the v0.5.6 experimental binary package is a separate Release asset, not project source. It must remain absent from this repository and from GitHub's generated source archives.
 
 v0.5.6 实验二进制包使用的社区修改版 `nvngx_dlssnr.dll` 是独立 Release 资产，不属于项目源码；本仓库及 GitHub 自动生成的源码归档中均不得包含该文件。
+
+The local 1.7.0 compatibility test layout supports four mutually selected DLSSNR variants under `DLSSNR-Runtimes`: an RTX20 SF-v2 FP16 community modification, a separate RTX30 community modification, an RTX40 community modification, and an original leaked runtime for RTX50. These runtime binaries remain local build inputs and must not be committed or described as an official NVIDIA public release.
+
+本地 1.7.0 兼容性测试布局支持在 `DLSSNR-Runtimes` 下互斥选择四种 DLSSNR 文件：RTX20 SF-v2 FP16 社区修改版、独立 RTX30 社区修改版、RTX40 社区修改版和供 RTX50 测试的原始泄露版。这些运行库仍是本地构建输入，不得提交到源码，也不得被表述为 NVIDIA 正式公开版本。
 
 各组件最终以对应 SDK/运行库随附的完整许可证原文为准，不能只依据本表摘要作发布决定。
 

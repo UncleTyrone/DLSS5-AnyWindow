@@ -44,6 +44,20 @@
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyDLSSNRRuntime" AfterTargets="Build" Condition="'$(Configuration)' == 'Release' And '$(EnableDLSSNR)' == 'true'">
+    <ItemGroup>
+      <_DLSSNRLegacyRuntime Include="$(DLSSNRRuntimeDir)\nvngx_dlssnr.dll" Condition="'$(DLSSNRRuntimeDir)' != '' And Exists('$(DLSSNRRuntimeDir)\nvngx_dlssnr.dll')" />
+      <_DLSSNRSFV2Runtime Include="$(DLSSNRRuntimeSFV2Dir)\nvngx_dlssnr.dll" Condition="'$(DLSSNRRuntimeSFV2Dir)' != '' And Exists('$(DLSSNRRuntimeSFV2Dir)\nvngx_dlssnr.dll')" />
+      <_DLSSNRRTX30Runtime Include="$(DLSSNRRuntimeRTX30Dir)\nvngx_dlssnr.dll" Condition="'$(DLSSNRRuntimeRTX30Dir)' != '' And Exists('$(DLSSNRRuntimeRTX30Dir)\nvngx_dlssnr.dll')" />
+      <_DLSSNRRTX40Runtime Include="$(DLSSNRRuntimeRTX40Dir)\nvngx_dlssnr.dll" Condition="'$(DLSSNRRuntimeRTX40Dir)' != '' And Exists('$(DLSSNRRuntimeRTX40Dir)\nvngx_dlssnr.dll')" />
+      <_DLSSNRRTX50Runtime Include="$(DLSSNRRuntimeRTX50Dir)\nvngx_dlssnr.dll" Condition="'$(DLSSNRRuntimeRTX50Dir)' != '' And Exists('$(DLSSNRRuntimeRTX50Dir)\nvngx_dlssnr.dll')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_DLSSNRLegacyRuntime)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="'@(_DLSSNRLegacyRuntime)' != ''" />
+    <Copy SourceFiles="@(_DLSSNRSFV2Runtime)" DestinationFolder="$(OutDir)DLSSNR-Runtimes\RTX20" SkipUnchangedFiles="true" Condition="'@(_DLSSNRSFV2Runtime)' != ''" />
+    <Copy SourceFiles="@(_DLSSNRRTX30Runtime)" DestinationFolder="$(OutDir)DLSSNR-Runtimes\RTX30" SkipUnchangedFiles="true" Condition="'@(_DLSSNRRTX30Runtime)' != ''" />
+    <Copy SourceFiles="@(_DLSSNRRTX40Runtime)" DestinationFolder="$(OutDir)DLSSNR-Runtimes\RTX40" SkipUnchangedFiles="true" Condition="'@(_DLSSNRRTX40Runtime)' != ''" />
+    <Copy SourceFiles="@(_DLSSNRRTX50Runtime)" DestinationFolder="$(OutDir)DLSSNR-Runtimes\RTX50" SkipUnchangedFiles="true" Condition="'@(_DLSSNRRTX50Runtime)' != ''" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
     <Import Project="..\..\packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('..\..\packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
     <Import Project="..\..\packages\Microsoft.Windows.CppWinRT.3.0.260520.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('..\..\packages\Microsoft.Windows.CppWinRT.3.0.260520.1\build\native\Microsoft.Windows.CppWinRT.targets')" />

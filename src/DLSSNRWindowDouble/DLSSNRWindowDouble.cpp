@@ -50,6 +50,8 @@ struct Arguments {
 	std::wstring stopEventName;
 	std::wstring statsMapName;
 	DWORD controllerPid = 0;
+	// 0 experimental DLSSNR, 1 stable single-frame CAS.
+	int backend = 0;
 	int style = 2;
 	float intensity = 1.0f;
 	float localToneStrength = 1.0f;
@@ -57,8 +59,8 @@ struct Arguments {
 	bool useAutoMask = false;
 	int guidanceMode = 0;
 	int depthInferenceInterval = 4;
-	int passes = 2;
-	bool antiFlicker = true;
+	int passes = 1;
+	int historyMode = 0;
 };
 
 std::filesystem::path ExeDirectory() {
@@ -118,6 +120,10 @@ Arguments ParseArguments() {
 				result.controllerPid = static_cast<DWORD>(
 					std::min<unsigned long long>(*value, MAXDWORD));
 			}
+		} else if (arg == L"--backend" && i + 1 < argc) {
+			if (auto value = ParseUnsigned(argv.get()[++i])) {
+				result.backend = static_cast<int>(std::min<unsigned long long>(*value, 1));
+			}
 		} else if (arg == L"--style" && i + 1 < argc) {
 			if (auto value = ParseUnsigned(argv.get()[++i])) {
 				result.style = static_cast<int>(std::min<unsigned long long>(*value, 2));
@@ -152,9 +158,16 @@ Arguments ParseArguments() {
 				result.passes = static_cast<int>(
 					std::clamp<unsigned long long>(*value, 1, 4));
 			}
+		} else if (arg == L"--history-mode" && i + 1 < argc) {
+			if (auto value = ParseUnsigned(argv.get()[++i])) {
+				result.historyMode = static_cast<int>(
+					std::min<unsigned long long>(*value, 2));
+			}
 		} else if (arg == L"--anti-flicker" && i + 1 < argc) {
 			if (auto value = ParseUnsigned(argv.get()[++i])) {
-				result.antiFlicker = *value != 0;
+				// Backward compatibility: the old toggle selected either an
+				// every-frame reset or fully continuous history.
+				result.historyMode = *value != 0 ? 1 : 2;
 			}
 		}
 	}
@@ -222,22 +235,30 @@ std::optional<GraphicsCardId> FindNvidiaAdapter() noexcept {
 
 ScalingOptions MakeOptions(const Arguments& args) {
 	ScalingOptions options;
-	if (const auto nvidiaAdapter = FindNvidiaAdapter()) {
-		options.graphicsCardId = *nvidiaAdapter;
-	}
 	EffectOption effect;
-	effect.name = "DLSSNR\\DLSSNR_AI_Filter";
-	effect.parameters = {
-		{ "style", static_cast<float>(args.style) },
-		{ "intensity", args.intensity },
-		{ "localToneStrength", args.localToneStrength },
-		{ "localStructureStrength", args.localStructureStrength },
-		{ "useAutoMask", args.useAutoMask ? 1.0f : 0.0f },
-		{ "guidanceMode", static_cast<float>(args.guidanceMode) },
-		{ "depthInferenceInterval", static_cast<float>(args.depthInferenceInterval) },
-		{ "passes", static_cast<float>(args.passes) },
-		{ "antiFlicker", args.antiFlicker ? 1.0f : 0.0f }
-	};
+	if (args.backend == 1) {
+		effect.name = "CAS\\CAS";
+		effect.parameters = { { "sharpness", args.intensity } };
+		Logger::Get().Info(fmt::format(
+			"Renderer backend=stable-cas sharpness={:.2f} temporalHistory=false", args.intensity));
+	} else {
+		if (const auto nvidiaAdapter = FindNvidiaAdapter()) {
+			options.graphicsCardId = *nvidiaAdapter;
+		}
+		effect.name = "DLSSNR\\DLSSNR_AI_Filter";
+		effect.parameters = {
+			{ "style", static_cast<float>(args.style) },
+			{ "intensity", args.intensity },
+			{ "localToneStrength", args.localToneStrength },
+			{ "localStructureStrength", args.localStructureStrength },
+			{ "useAutoMask", args.useAutoMask ? 1.0f : 0.0f },
+			{ "guidanceMode", static_cast<float>(args.guidanceMode) },
+			{ "depthInferenceInterval", static_cast<float>(args.depthInferenceInterval) },
+			{ "passes", static_cast<float>(args.passes) },
+			{ "historyMode", static_cast<float>(args.historyMode) }
+		};
+		Logger::Get().Info("Renderer backend=experimental-dlssnr");
+	}
 	options.effects.push_back(std::move(effect));
 	options.captureMethod = CaptureMethod::GraphicsCapture;
 	options.duplicateFrameDetectionMode = DuplicateFrameDetectionMode::Dynamic;
@@ -339,11 +360,14 @@ int wmain() {
 		}
 	}
 	if (sharedStats && sharedStats->magic == DLSS5_STATS_MAGIC) {
-		sharedStats->version = 2;
+		sharedStats->version = 3;
 		InterlockedExchange(&sharedStats->featureState, DLSS5FeaturePending);
 		InterlockedExchange(&sharedStats->evaluateSuccessCount, 0);
 		InterlockedExchange(&sharedStats->evaluateFailureCount, 0);
-		InterlockedExchange(&sharedStats->configuredPasses, args.passes);
+		InterlockedExchange(&sharedStats->configuredPasses, args.backend == 1 ? 1 : args.passes);
+		InterlockedExchange(&sharedStats->runtimeKind, DLSS5RuntimeUnknown);
+		InterlockedExchange(&sharedStats->cudaComputeMajor, 0);
+		InterlockedExchange(&sharedStats->cudaComputeMinor, 0);
 	}
 	auto unmapStats = wil::scope_exit([&]() {
 		if (sharedStats) UnmapViewOfFile(sharedStats);
@@ -381,7 +405,11 @@ int wmain() {
 
 	const std::wstring title = targetInfo.title.empty() ? WindowTitle(target) : targetInfo.title;
 	std::wcout << L"目标窗口：" << title << L"\n";
-	std::wcout << L"正在启动 " << args.passes << L" 次 DLSS5；按 Esc 关闭。\n";
+	if (args.backend == 1) {
+		std::wcout << L"正在启动稳定高速 CAS；按 Esc 关闭。\n";
+	} else {
+		std::wcout << L"正在启动 " << args.passes << L" 次 DLSS5；按 Esc 关闭。\n";
+	}
 
 	if (HWND existing = FindWindowW(DLSS5WindowTarget::SCALING_WINDOW_CLASS, nullptr)) {
 		DWORD existingPid = 0;
@@ -404,14 +432,15 @@ int wmain() {
 
 	winrt::init_apartment(winrt::apartment_type::single_threaded);
 	ScalingOptions options = MakeOptions(args);
-	if (options.graphicsCardId.idx < 0) {
+	if (args.backend == 0 && options.graphicsCardId.idx < 0) {
 		MessageBoxW(nullptr,
 			L"未检测到 NVIDIA 显卡。此便携版需要兼容的 NVIDIA RTX 显卡和已安装的官方驱动。",
 			L"DLSS5 多次滤镜", MB_OK | MB_ICONERROR | MB_TOPMOST);
 		return EXIT_NO_NVIDIA;
 	}
 
-	if (!RegisterHotKey(nullptr, STOP_HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10)) {
+	if (!args.controllerPid &&
+		!RegisterHotKey(nullptr, STOP_HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F10)) {
 		Logger::Get().Win32Warn("RegisterHotKey Ctrl+Alt+F10 failed");
 		std::wcout << L"提示：备用热键注册失败，仍可按 Esc 关闭。\n";
 	}
@@ -439,15 +468,32 @@ int wmain() {
 				std::chrono::steady_clock::now() + 100ms, runtime, stopEvent.get())) break;
 			if (sharedStats && sharedStats->magic == DLSS5_STATS_MAGIC) {
 				InterlockedExchange(&sharedStats->fps, static_cast<LONG>(runtime.FPS()));
-				const DLSSNRTelemetry telemetry = DLSSNRFilter::RuntimeTelemetry();
-				InterlockedExchange(
-					&sharedStats->featureState, static_cast<LONG>(telemetry.state));
-				InterlockedExchange(
-					&sharedStats->evaluateSuccessCount,
-					static_cast<LONG>(std::min<uint32_t>(telemetry.evaluateSuccessCount, LONG_MAX)));
-				InterlockedExchange(
-					&sharedStats->evaluateFailureCount,
-					static_cast<LONG>(std::min<uint32_t>(telemetry.evaluateFailureCount, LONG_MAX)));
+				if (args.backend == 1) {
+					const ScalingState state = runtime.State();
+					InterlockedExchange(
+						&sharedStats->featureState,
+						state == ScalingState::Scaling
+							? DLSS5FeatureEvaluating
+							: (state == ScalingState::Waiting
+								? DLSS5FeatureFailed : DLSS5FeaturePending));
+				} else {
+					const DLSSNRTelemetry telemetry = DLSSNRFilter::RuntimeTelemetry();
+					InterlockedExchange(
+						&sharedStats->featureState, static_cast<LONG>(telemetry.state));
+					InterlockedExchange(
+						&sharedStats->evaluateSuccessCount,
+						static_cast<LONG>(std::min<uint32_t>(telemetry.evaluateSuccessCount, LONG_MAX)));
+					InterlockedExchange(
+						&sharedStats->evaluateFailureCount,
+						static_cast<LONG>(std::min<uint32_t>(telemetry.evaluateFailureCount, LONG_MAX)));
+					InterlockedExchange(
+						&sharedStats->runtimeKind,
+						static_cast<LONG>(telemetry.runtimeKind));
+					InterlockedExchange(
+						&sharedStats->cudaComputeMajor, telemetry.cudaComputeMajor);
+					InterlockedExchange(
+						&sharedStats->cudaComputeMinor, telemetry.cudaComputeMinor);
+				}
 			}
 			if (!IsWindow(target)) {
 				Logger::Get().Info("Target window was destroyed; stopping renderer");

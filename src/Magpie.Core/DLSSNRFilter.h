@@ -12,10 +12,23 @@ enum class DLSSNRRuntimeState : int32_t {
 	Evaluating = 2
 };
 
+enum class DLSSNRRuntimeKind : int32_t {
+	Unknown = 0,
+	ShortFuseFp16 = 1,
+	Rtx40Patched = 2,
+	Rtx50Original = 3,
+	Custom = 4,
+	LegacyRoot = 5,
+	Rtx30Patched = 6
+};
+
 struct DLSSNRTelemetry {
 	DLSSNRRuntimeState state = DLSSNRRuntimeState::Pending;
 	uint32_t evaluateSuccessCount = 0;
 	uint32_t evaluateFailureCount = 0;
+	DLSSNRRuntimeKind runtimeKind = DLSSNRRuntimeKind::Unknown;
+	int32_t cudaComputeMajor = 0;
+	int32_t cudaComputeMinor = 0;
 };
 
 struct DLSSNRSettings {
@@ -30,9 +43,10 @@ struct DLSSNRSettings {
 	// Re-evaluate the same feature with the first pass output as the next input.
 	// This avoids creating a second NGX session, which the signed snippet rejects.
 	uint32_t passes = 1;
-	// Reset temporal history at the start of every source frame. This keeps a
-	// deterministic within-frame pass chain when real motion vectors are absent.
-	bool antiFlicker = false;
+	// 0 adaptive: preserve history only when usable motion guidance is present.
+	// 1 static-stable: reset at the start of every source frame.
+	// 2 continuous: preserve history except for provider/resize/scene resets.
+	int historyMode = 0;
 };
 
 // Experimental same-resolution DLSS neural filter. Magpie only owns the

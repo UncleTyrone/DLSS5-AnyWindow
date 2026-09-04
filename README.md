@@ -154,7 +154,7 @@ Third-party SDKs, models, wheels, and proprietary NVIDIA binaries are not part o
 
 To build the optional backends, create `src/BuildOptions.props.user` and define the feature switches and local SDK paths there. The file is excluded by `.gitignore`; it is machine-specific and must not be committed to the public repository.
 
-The v0.5.6 experimental binary package uses a community-modified `nvngx_dlssnr.dll` 310.8.0.0 intended for RTX 40-series and RTX 50-series testing. That DLL is a Release asset only: it is not included in this source tree or the automatically generated source archives. Because it was modified, its Authenticode file hash no longer matches NVIDIA's original signature.
+The v1.7.0 AnyWindow source supports separate runtime-selection branches for RTX 20, RTX 30, RTX 40, and RTX 50. An external RTX 3090 field test confirmed that the RTX 30 branch starts and produces a visible processed result. Runtime/model DLLs are local build inputs only: they are not included in this source tree or GitHub's automatically generated source archives. See the [v1.7.0 release notes](docs/RELEASE_NOTES_v1.7.0-rtx30-runtime.md) for the exact scope and limitations.
 
 Native upscalers and RTX Video are dispatched through the shared `NativeEffectBackend` interface and `NativeEffectBackendFactory`. This keeps SDK-specific detection, creation, resize, and draw logic out of the main Renderer path. Frame-generation presenters remain separate because they publish additional frames at the terminal presentation stage.
 

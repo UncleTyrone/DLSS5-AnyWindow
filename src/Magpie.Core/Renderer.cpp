@@ -22,6 +22,7 @@
 #include "NativeEffectBackend.h"
 #include "NativeEffectBackendFactory.h"
 #include "NvidiaOpticalFlowProvider.h"
+#include "HalfResOpticalFlow.h"
 #include "DepthAnythingV2Provider.h"
 #include "XeSSFGPresenter.h"
 #ifdef MP_USE_COMPSWAPCHAIN
@@ -225,6 +226,20 @@ void Renderer::OnCursorVisibilityChanged(bool isVisible, bool onDestory) {
 	_backendThreadDispatcher.TryEnqueue([this, isVisible, onDestory]() {
 		if (_frameSource) {
 			_frameSource->OnCursorVisibilityChanged(isVisible, onDestory);
+			if (isVisible && !onDestory &&
+				_frameGuidanceService.IsInitialized()) {
+				_frameGuidanceService.ResetHistory(
+					FrameGuidanceResetReason::CaptureInterrupted);
+			}
+		}
+	});
+}
+
+void Renderer::OnSourceFocusChanged() noexcept {
+	_backendThreadDispatcher.TryEnqueue([this]() {
+		if (_frameGuidanceService.IsInitialized()) {
+			_frameGuidanceService.ResetHistory(
+				FrameGuidanceResetReason::CaptureInterrupted);
 		}
 	});
 }
@@ -785,11 +800,23 @@ ID3D11Texture2D* Renderer::_ResizeEffects() noexcept {
 	const FrameGuidanceRequirements guidanceRequirements =
 		CollectFrameGuidanceRequirements(
 			_nativeEffectBackends, _dlssFrameGenerator.get());
-	if (_frameGuidanceService.IsInitialized() && !_frameGuidanceService.Resize(
-		{ sourceDesc.Width, sourceDesc.Height }, _capturedFrameId,
-		guidanceRequirements)) {
-		Logger::Get().Error("Resize Frame Guidance service failed");
-		return nullptr;
+	if (_frameGuidanceService.IsInitialized()) {
+		const FrameGuidanceExtent sourceExtent{
+			sourceDesc.Width, sourceDesc.Height
+		};
+		if (!_frameGuidanceService.Resize(
+			sourceExtent, _capturedFrameId, guidanceRequirements)) {
+			Logger::Get().Error("Resize Frame Guidance service failed");
+			return nullptr;
+		}
+		// Re-seed resized providers from the last real capture. Producing a
+		// color-less pseudo-frame here would contaminate temporal history.
+		if (_capturedFrameId != 0 && !_frameGuidanceService.BeginFrame(
+			_capturedFrameId, inOutTexture, guidanceRequirements
+		).IsValidFor(_capturedFrameId, sourceExtent)) {
+			Logger::Get().Error("Produce Frame Guidance after resize failed");
+			return nullptr;
+		}
 	}
 	for (uint32_t i = 0; i < effectCount; ++i) {
 		if (!_effectDrawers[i].ResizeTextures(
@@ -1203,12 +1230,15 @@ HANDLE Renderer::_InitBackend() noexcept {
 		CollectFrameGuidanceRequirements(
 			_nativeEffectBackends, _dlssFrameGenerator.get());
 	if (guidanceRequirements.Any()) {
-#ifdef MP_ENABLE_NVIDIA_OPTICAL_FLOW
 		if (guidanceRequirements.motion) {
+#ifdef MP_ENABLE_NVIDIA_OPTICAL_FLOW
 			_frameGuidanceService.SetMotionVectorProvider(
 				std::make_unique<NvidiaOpticalFlowProvider>());
-		}
+#else
+			_frameGuidanceService.SetMotionVectorProvider(
+				std::make_unique<SoftwareOpticalFlowProvider>());
 #endif
+		}
 #ifdef MP_ENABLE_DEPTH_ANYTHING_V2
 		if (guidanceRequirements.depth) {
 			_frameGuidanceService.SetDepthProvider(
@@ -1259,6 +1289,13 @@ void Renderer::_BackendRender(
 ) noexcept {
 	_stepTimer.PrepareForRender();
 	if (isNewCaptureFrame) {
+		const auto captureTime = std::chrono::steady_clock::now();
+		if (_lastCapturedFrameTime != std::chrono::steady_clock::time_point{} &&
+			captureTime - _lastCapturedFrameTime >= std::chrono::milliseconds(500) &&
+			_frameGuidanceService.IsInitialized()) {
+			_frameGuidanceService.ResetHistory(FrameGuidanceResetReason::LongPause);
+		}
+		_lastCapturedFrameTime = captureTime;
 		++_capturedFrameId;
 		const FrameGuidanceRequirements guidanceRequirements =
 			CollectFrameGuidanceRequirements(
