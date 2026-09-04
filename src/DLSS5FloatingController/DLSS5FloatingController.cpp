@@ -1163,7 +1163,7 @@ void BeginHotkeyCapture(ControllerData& data, HotkeyCapture capture) {
 	data.hotkeyCapture = capture;
 	data.capturedHotkeyModifiers = 0;
 	data.targetTitle = capture == HotkeyCapture::WindowVisibility
-		? L"请按新的浮窗隐藏/显示组合键" : L"请按新的滤镜开关组合键";
+		? L"请按浮窗组合键，例如 Alt+Q" : L"请按滤镜组合键，例如 Ctrl+A";
 	SetFocus(data.hwnd);
 	InvalidateRect(data.hwnd, nullptr, FALSE);
 }
@@ -1802,7 +1802,7 @@ void PaintAppearanceSettings(HDC dc, ControllerData& data) {
 
 	SetTextColor(dc, PARCHMENT_MUTED);
 	RECT hotkeyHint{ Dip(data, 19), Dip(data, 322), client.right - Dip(data, 19), Dip(data, 345) };
-	DrawTextW(dc, L"点击录入 · Esc 取消 · Backspace 停用", -1, &hotkeyHint,
+	DrawTextW(dc, L"双键可用：Ctrl+A / Alt+Q · Backspace 停用", -1, &hotkeyHint,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
 	SetTextColor(dc, PARCHMENT);
