@@ -46,9 +46,9 @@ The community-modified `nvngx_dlssnr.dll` used by the v0.5.6 experimental binary
 
 v0.5.6 实验二进制包使用的社区修改版 `nvngx_dlssnr.dll` 是独立 Release 资产，不属于项目源码；本仓库及 GitHub 自动生成的源码归档中均不得包含该文件。
 
-The local 1.7.0 compatibility test layout supports four mutually selected DLSSNR variants under `DLSSNR-Runtimes`: an RTX20 SF-v2 FP16 community modification, a separate RTX30 community modification, an RTX40 community modification, and an original leaked runtime for RTX50. These runtime binaries remain local build inputs and must not be committed or described as an official NVIDIA public release.
+The local 1.7.0-and-later compatibility test layout supports four mutually selected DLSSNR variants under `DLSSNR-Runtimes`: an RTX20 SF-v2 FP16 community modification, a separate RTX30 community modification, an RTX40 community modification, and an original leaked runtime for RTX50. These runtime binaries remain local build inputs and must not be committed or described as an official NVIDIA public release.
 
-本地 1.7.0 兼容性测试布局支持在 `DLSSNR-Runtimes` 下互斥选择四种 DLSSNR 文件：RTX20 SF-v2 FP16 社区修改版、独立 RTX30 社区修改版、RTX40 社区修改版和供 RTX50 测试的原始泄露版。这些运行库仍是本地构建输入，不得提交到源码，也不得被表述为 NVIDIA 正式公开版本。
+本地 1.7.0 及后续兼容性测试布局支持在 `DLSSNR-Runtimes` 下互斥选择四种 DLSSNR 文件：RTX20 SF-v2 FP16 社区修改版、独立 RTX30 社区修改版、RTX40 社区修改版和供 RTX50 测试的原始泄露版。这些运行库仍是本地构建输入，不得提交到源码，也不得被表述为 NVIDIA 正式公开版本。
 
 各组件最终以对应 SDK/运行库随附的完整许可证原文为准，不能只依据本表摘要作发布决定。
 
