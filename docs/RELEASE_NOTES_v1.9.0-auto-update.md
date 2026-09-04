@@ -11,8 +11,7 @@
 ## 项目信息
 
 - “关于”页新增 GitHub 源代码链接：<https://github.com/Shangyuwang11/DLSS5-AnyWindow>
-- 新增作者主页链接：<https://github.com/Shangyuwang11>
-- Windows 文件属性中加入产品名、作者和 `1.9.0` 版本信息。
+- Windows 文件属性中加入产品名和 `1.9.0` 版本信息。
 
 ## Release 附件约定
 

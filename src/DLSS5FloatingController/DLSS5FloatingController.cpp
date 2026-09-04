@@ -33,13 +33,12 @@ constexpr wchar_t INSTANCE_MUTEX[] = L"Local\\DLSS5DoubleFloatingController.Sing
 constexpr wchar_t INSTANCE_MUTEX_QA[] = L"Local\\DLSS5DoubleFloatingController.PixelQaInstance";
 constexpr wchar_t ENGINE_NAME[] = L"DLSSNRWindowDouble.exe";
 constexpr wchar_t SETTINGS_FILE[] = L"DLSS5-settings.ini";
-constexpr wchar_t APP_VERSION[] = L"1.9.0";
+constexpr wchar_t APP_VERSION[] = L"1.9.1";
 constexpr int APP_VERSION_MAJOR = 1;
 constexpr int APP_VERSION_MINOR = 9;
-constexpr int APP_VERSION_PATCH = 0;
+constexpr int APP_VERSION_PATCH = 1;
 constexpr wchar_t GITHUB_REPOSITORY_URL[] =
 	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow";
-constexpr wchar_t GITHUB_AUTHOR_URL[] = L"https://github.com/Shangyuwang11";
 constexpr wchar_t GITHUB_RELEASES_API[] =
 	L"https://api.github.com/repos/Shangyuwang11/DLSS5-AnyWindow/releases?per_page=20";
 constexpr int TOGGLE_HOTKEY_ID = 0xD157;
@@ -398,12 +397,6 @@ RECT AboutSourceLinkRect(const ControllerData& data) {
 	return { Dip(data, 18), Dip(data, 349), client.right - Dip(data, 18), Dip(data, 387) };
 }
 
-RECT AboutAuthorLinkRect(const ControllerData& data) {
-	RECT client{};
-	GetClientRect(data.hwnd, &client);
-	return { Dip(data, 18), Dip(data, 397), client.right - Dip(data, 18), Dip(data, 435) };
-}
-
 RECT ResetRect(const ControllerData& data) {
 	RECT client{};
 	GetClientRect(data.hwnd, &client);
@@ -617,7 +610,7 @@ bool HttpGet(
 	if (resource.empty()) resource = L"/";
 
 	HINTERNET session = WinHttpOpen(
-		L"DLSS5-AnyWindow-Updater/1.9.0",
+		L"DLSS5-AnyWindow-Updater/1.9.1",
 		WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
 		WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!session) {
@@ -1734,14 +1727,8 @@ void PaintAboutSettings(HDC dc, ControllerData& data) {
 	DrawTextW(dc, L"GitHub 源代码  ↗", -1, &source,
 		DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-	RECT author = AboutAuthorLinkRect(data);
-	FillPanel(dc, author, WOOD_PANEL_DARK, WOOD_BORDER_LIGHT, WOOD_BORDER_DARK);
-	SetTextColor(dc, GOLD);
-	DrawTextW(dc, L"作者主页  Shangyuwang11  ↗", -1, &author,
-		DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
 	SetTextColor(dc, PARCHMENT_MUTED);
-	RECT linkHint{ Dip(data, 19), Dip(data, 447), client.right - Dip(data, 19), Dip(data, 493) };
+	RECT linkHint{ Dip(data, 19), Dip(data, 401), client.right - Dip(data, 19), Dip(data, 447) };
 	DrawTextW(dc, L"更新通过 HTTPS 从项目 Release 获取，并校验 SHA-256。", -1, &linkHint,
 		DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
 }
@@ -2259,11 +2246,6 @@ bool HandleSettingsPress(ControllerData& data, POINT point) {
 		}
 		if (PointIn(AboutSourceLinkRect(data), point)) {
 			ShellExecuteW(data.hwnd, L"open", GITHUB_REPOSITORY_URL,
-				nullptr, nullptr, SW_SHOWNORMAL);
-			return true;
-		}
-		if (PointIn(AboutAuthorLinkRect(data), point)) {
-			ShellExecuteW(data.hwnd, L"open", GITHUB_AUTHOR_URL,
 				nullptr, nullptr, SW_SHOWNORMAL);
 			return true;
 		}
