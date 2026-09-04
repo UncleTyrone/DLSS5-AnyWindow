@@ -12,6 +12,8 @@
 
 - “关于”页新增 GitHub 源代码链接：<https://github.com/Shangyuwang11/DLSS5-AnyWindow>
 - Windows 文件属性中加入产品名和 `1.9.0` 版本信息。
+- “关于”页不提供作者个人主页入口。
+- 快捷键支持一个修饰键加一个普通键，例如 `Ctrl+A` 或 `Alt+Q`，不要求三个键。
 
 ## Release 附件约定
 
@@ -24,4 +26,4 @@
 
 ## English summary
 
-The floating controller now has an About page, non-blocking GitHub Release checks, explicit user-confirmed self-update, SHA-256 verification, and repository/author links. The updater replaces only the controller executable and preserves all user settings, models, and local rendering runtimes.
+The floating controller now has an About page, non-blocking GitHub Release checks, explicit user-confirmed self-update, SHA-256 verification, the repository link, and two-key shortcut capture. The updater replaces only the controller executable and preserves all user settings, models, and local rendering runtimes.

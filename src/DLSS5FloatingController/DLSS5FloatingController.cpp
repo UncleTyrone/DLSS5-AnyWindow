@@ -33,10 +33,10 @@ constexpr wchar_t INSTANCE_MUTEX[] = L"Local\\DLSS5DoubleFloatingController.Sing
 constexpr wchar_t INSTANCE_MUTEX_QA[] = L"Local\\DLSS5DoubleFloatingController.PixelQaInstance";
 constexpr wchar_t ENGINE_NAME[] = L"DLSSNRWindowDouble.exe";
 constexpr wchar_t SETTINGS_FILE[] = L"DLSS5-settings.ini";
-constexpr wchar_t APP_VERSION[] = L"1.9.1";
+constexpr wchar_t APP_VERSION[] = L"1.9.0";
 constexpr int APP_VERSION_MAJOR = 1;
 constexpr int APP_VERSION_MINOR = 9;
-constexpr int APP_VERSION_PATCH = 1;
+constexpr int APP_VERSION_PATCH = 0;
 constexpr wchar_t GITHUB_REPOSITORY_URL[] =
 	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow";
 constexpr wchar_t GITHUB_RELEASES_API[] =
@@ -610,7 +610,7 @@ bool HttpGet(
 	if (resource.empty()) resource = L"/";
 
 	HINTERNET session = WinHttpOpen(
-		L"DLSS5-AnyWindow-Updater/1.9.1",
+		L"DLSS5-AnyWindow-Updater/1.9.0",
 		WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
 		WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!session) {
