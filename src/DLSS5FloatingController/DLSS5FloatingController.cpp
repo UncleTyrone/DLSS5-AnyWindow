@@ -2,22 +2,28 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <bcrypt.h>
 #include <dwmapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <shellapi.h>
 #include <shellscalingapi.h>
+#include <winhttp.h>
 
 #include "../Shared/DLSS5StatsShared.h"
 #include "../Shared/DLSS5WindowTarget.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -27,8 +33,18 @@ constexpr wchar_t INSTANCE_MUTEX[] = L"Local\\DLSS5DoubleFloatingController.Sing
 constexpr wchar_t INSTANCE_MUTEX_QA[] = L"Local\\DLSS5DoubleFloatingController.PixelQaInstance";
 constexpr wchar_t ENGINE_NAME[] = L"DLSSNRWindowDouble.exe";
 constexpr wchar_t SETTINGS_FILE[] = L"DLSS5-settings.ini";
+constexpr wchar_t APP_VERSION[] = L"1.9.0";
+constexpr int APP_VERSION_MAJOR = 1;
+constexpr int APP_VERSION_MINOR = 9;
+constexpr int APP_VERSION_PATCH = 0;
+constexpr wchar_t GITHUB_REPOSITORY_URL[] =
+	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow";
+constexpr wchar_t GITHUB_AUTHOR_URL[] = L"https://github.com/Shangyuwang11";
+constexpr wchar_t GITHUB_RELEASES_API[] =
+	L"https://api.github.com/repos/Shangyuwang11/DLSS5-AnyWindow/releases?per_page=20";
 constexpr int TOGGLE_HOTKEY_ID = 0xD157;
 constexpr int VISIBILITY_HOTKEY_ID = 0xD158;
+constexpr UINT WM_UPDATE_WORKER_RESULT = WM_APP + 0x157;
 constexpr DWORD ENGINE_EXIT_EXISTING_SCALING = 5;
 constexpr DWORD ENGINE_EXIT_ALREADY_RUNNING = 6;
 constexpr UINT_PTR TIMER_SELECT = 1;
@@ -128,6 +144,33 @@ enum class HotkeyCapture {
 	WindowVisibility
 };
 
+enum class UpdateState {
+	Idle,
+	Checking,
+	Current,
+	Available,
+	Downloading,
+	Failed
+};
+
+struct VersionNumber {
+	int major = 0;
+	int minor = 0;
+	int patch = 0;
+};
+
+struct UpdateWorkerResult {
+	bool download = false;
+	bool success = false;
+	bool updateAvailable = false;
+	std::wstring version;
+	std::wstring releaseUrl;
+	std::wstring assetUrl;
+	std::wstring hashUrl;
+	std::wstring downloadedPath;
+	std::wstring message;
+};
+
 struct FilterSettings {
 	// 0 experimental DLSSNR, 1 stable single-frame CAS.
 	int backend = 0;
@@ -153,6 +196,7 @@ struct UiSettings {
 	int opacity = 100;
 	UINT visibilityHotkeyModifiers = MOD_CONTROL | MOD_ALT;
 	UINT visibilityHotkeyVirtualKey = VK_F9;
+	bool autoCheckUpdates = true;
 };
 
 struct ControllerData {
@@ -195,6 +239,12 @@ struct ControllerData {
 	bool motionGuidanceHardware = false;
 	bool motionGuidanceSoftware = false;
 	bool depthGuidanceAvailable = false;
+	UpdateState updateState = UpdateState::Idle;
+	std::wstring updateVersion;
+	std::wstring updateReleaseUrl;
+	std::wstring updateAssetUrl;
+	std::wstring updateHashUrl;
+	std::wstring updateMessage;
 	FilterSettings settings;
 	UiSettings uiSettings;
 	HFONT titleFont = nullptr;
@@ -302,8 +352,8 @@ RECT BackendRect(const ControllerData& data) {
 }
 
 RECT SettingsTabRect(const ControllerData& data, int page) {
-	const int left = page == 0 ? 18 : 108;
-	return { Dip(data, left), Dip(data, 80), Dip(data, left + 86), Dip(data, 106) };
+	const int left = 18 + page * 72;
+	return { Dip(data, left), Dip(data, 80), Dip(data, left + 68), Dip(data, 106) };
 }
 
 RECT UiThemeRect(const ControllerData& data) {
@@ -328,6 +378,30 @@ RECT VisibilityHotkeyRect(const ControllerData& data) {
 	RECT client{};
 	GetClientRect(data.hwnd, &client);
 	return { Dip(data, 130), Dip(data, 365), client.right - Dip(data, 18), Dip(data, 399) };
+}
+
+RECT AboutAutoUpdateRect(const ControllerData& data) {
+	RECT client{};
+	GetClientRect(data.hwnd, &client);
+	return { Dip(data, 18), Dip(data, 155), client.right - Dip(data, 18), Dip(data, 187) };
+}
+
+RECT AboutUpdateActionRect(const ControllerData& data) {
+	RECT client{};
+	GetClientRect(data.hwnd, &client);
+	return { Dip(data, 18), Dip(data, 257), client.right - Dip(data, 18), Dip(data, 301) };
+}
+
+RECT AboutSourceLinkRect(const ControllerData& data) {
+	RECT client{};
+	GetClientRect(data.hwnd, &client);
+	return { Dip(data, 18), Dip(data, 349), client.right - Dip(data, 18), Dip(data, 387) };
+}
+
+RECT AboutAuthorLinkRect(const ControllerData& data) {
+	RECT client{};
+	GetClientRect(data.hwnd, &client);
+	return { Dip(data, 18), Dip(data, 397), client.right - Dip(data, 18), Dip(data, 435) };
 }
 
 RECT ResetRect(const ControllerData& data) {
@@ -454,6 +528,8 @@ void LoadSettings(ControllerData& data) {
 	data.uiSettings.visibilityHotkeyVirtualKey = static_cast<UINT>(std::clamp<int>(
 		GetPrivateProfileIntW(L"UI", L"VisibilityHotkeyVirtualKey", VK_F9, path.c_str()),
 		0, 0xff));
+	data.uiSettings.autoCheckUpdates = GetPrivateProfileIntW(
+		L"UI", L"AutoCheckUpdates", 1, path.c_str()) != 0;
 	if (!GuidanceModeAvailable(data, data.settings.guidanceMode)) {
 		data.settings.guidanceMode = 1;
 	}
@@ -493,6 +569,482 @@ void SaveSettings(const ControllerData& data) {
 		static_cast<int>(data.uiSettings.visibilityHotkeyModifiers));
 	SaveSetting(path, L"UI", L"VisibilityHotkeyVirtualKey",
 		static_cast<int>(data.uiSettings.visibilityHotkeyVirtualKey));
+	SaveSetting(path, L"UI", L"AutoCheckUpdates",
+		data.uiSettings.autoCheckUpdates ? 1 : 0);
+}
+
+std::wstring Utf8ToWide(std::string_view text) {
+	if (text.empty()) return {};
+	const int length = MultiByteToWideChar(
+		CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), static_cast<int>(text.size()), nullptr, 0);
+	if (length <= 0) return {};
+	std::wstring result(static_cast<size_t>(length), L'\0');
+	MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+		static_cast<int>(text.size()), result.data(), length);
+	return result;
+}
+
+std::string WideToUtf8(std::wstring_view text) {
+	if (text.empty()) return {};
+	const int length = WideCharToMultiByte(
+		CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+	if (length <= 0) return {};
+	std::string result(static_cast<size_t>(length), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+		result.data(), length, nullptr, nullptr);
+	return result;
+}
+
+bool HttpGet(
+	std::wstring_view url, size_t maximumBytes,
+	std::vector<uint8_t>& response, std::wstring& error
+) {
+	URL_COMPONENTS components{ sizeof(components) };
+	components.dwSchemeLength = static_cast<DWORD>(-1);
+	components.dwHostNameLength = static_cast<DWORD>(-1);
+	components.dwUrlPathLength = static_cast<DWORD>(-1);
+	components.dwExtraInfoLength = static_cast<DWORD>(-1);
+	if (!WinHttpCrackUrl(url.data(), static_cast<DWORD>(url.size()), 0, &components)) {
+		error = L"网址解析失败（" + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+
+	const std::wstring host(components.lpszHostName, components.dwHostNameLength);
+	std::wstring resource(components.lpszUrlPath, components.dwUrlPathLength);
+	if (components.dwExtraInfoLength) {
+		resource.append(components.lpszExtraInfo, components.dwExtraInfoLength);
+	}
+	if (resource.empty()) resource = L"/";
+
+	HINTERNET session = WinHttpOpen(
+		L"DLSS5-AnyWindow-Updater/1.9.0",
+		WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+		WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!session) {
+		error = L"网络初始化失败（" + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+	WinHttpSetTimeouts(session, 5000, 5000, 10000, 15000);
+	HINTERNET connection = WinHttpConnect(
+		session, host.c_str(), components.nPort, 0);
+	if (!connection) {
+		error = L"连接 GitHub 失败（" + std::to_wstring(GetLastError()) + L"）";
+		WinHttpCloseHandle(session);
+		return false;
+	}
+	const DWORD flags = components.nScheme == INTERNET_SCHEME_HTTPS
+		? WINHTTP_FLAG_SECURE : 0;
+	HINTERNET request = WinHttpOpenRequest(
+		connection, L"GET", resource.c_str(), nullptr, WINHTTP_NO_REFERER,
+		WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+	if (!request) {
+		error = L"创建更新请求失败（" + std::to_wstring(GetLastError()) + L"）";
+		WinHttpCloseHandle(connection);
+		WinHttpCloseHandle(session);
+		return false;
+	}
+	DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+	WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
+		&redirectPolicy, sizeof(redirectPolicy));
+	constexpr wchar_t headers[] =
+		L"Accept: application/vnd.github+json\r\n"
+		L"X-GitHub-Api-Version: 2022-11-28\r\n";
+	bool ok = WinHttpSendRequest(request, headers, static_cast<DWORD>(-1),
+		WINHTTP_NO_REQUEST_DATA, 0, 0, 0) != FALSE &&
+		WinHttpReceiveResponse(request, nullptr) != FALSE;
+	if (!ok) {
+		error = L"GitHub 请求失败（" + std::to_wstring(GetLastError()) + L"）";
+	} else {
+		DWORD status = 0;
+		DWORD statusSize = sizeof(status);
+		if (!WinHttpQueryHeaders(request,
+			WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+			WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+			WINHTTP_NO_HEADER_INDEX) || status < 200 || status >= 300) {
+			error = L"GitHub 返回 HTTP " + std::to_wstring(status);
+			ok = false;
+		}
+	}
+	while (ok) {
+		DWORD available = 0;
+		if (!WinHttpQueryDataAvailable(request, &available)) {
+			error = L"读取更新数据失败（" + std::to_wstring(GetLastError()) + L"）";
+			ok = false;
+			break;
+		}
+		if (!available) break;
+		if (response.size() + available > maximumBytes) {
+			error = L"更新数据大小异常";
+			ok = false;
+			break;
+		}
+		const size_t oldSize = response.size();
+		response.resize(oldSize + available);
+		DWORD read = 0;
+		if (!WinHttpReadData(request, response.data() + oldSize, available, &read)) {
+			error = L"下载更新数据失败（" + std::to_wstring(GetLastError()) + L"）";
+			ok = false;
+			break;
+		}
+		response.resize(oldSize + read);
+	}
+	WinHttpCloseHandle(request);
+	WinHttpCloseHandle(connection);
+	WinHttpCloseHandle(session);
+	return ok;
+}
+
+std::string JsonStringAfter(
+	const std::string& json, std::string_view key,
+	size_t start, size_t end = std::string::npos
+) {
+	const std::string needle = "\"" + std::string(key) + "\"";
+	const size_t keyPosition = json.find(needle, start);
+	if (keyPosition == std::string::npos || keyPosition >= end) return {};
+	const size_t colon = json.find(':', keyPosition + needle.size());
+	if (colon == std::string::npos || colon >= end) return {};
+	const size_t quote = json.find('"', colon + 1);
+	if (quote == std::string::npos || quote >= end) return {};
+	std::string value;
+	for (size_t index = quote + 1; index < json.size() && index < end; ++index) {
+		const char ch = json[index];
+		if (ch == '"') return value;
+		if (ch == '\\' && index + 1 < json.size()) {
+			const char escaped = json[++index];
+			switch (escaped) {
+			case '"': value.push_back('"'); break;
+			case '\\': value.push_back('\\'); break;
+			case '/': value.push_back('/'); break;
+			case 'b': value.push_back('\b'); break;
+			case 'f': value.push_back('\f'); break;
+			case 'n': value.push_back('\n'); break;
+			case 'r': value.push_back('\r'); break;
+			case 't': value.push_back('\t'); break;
+			default: return {};
+			}
+		} else {
+			value.push_back(ch);
+		}
+	}
+	return {};
+}
+
+bool ParseReleaseVersion(std::string_view tag, VersionNumber& version) {
+	if (tag.empty() || (tag.front() != 'v' && tag.front() != 'V')) return false;
+	size_t position = 1;
+	auto parsePart = [&](int& value) {
+		if (position >= tag.size() || tag[position] < '0' || tag[position] > '9') return false;
+		value = 0;
+		while (position < tag.size() && tag[position] >= '0' && tag[position] <= '9') {
+			value = value * 10 + (tag[position++] - '0');
+			if (value > 100000) return false;
+		}
+		return true;
+	};
+	if (!parsePart(version.major) || position >= tag.size() || tag[position++] != '.' ||
+		!parsePart(version.minor) || position >= tag.size() || tag[position++] != '.' ||
+		!parsePart(version.patch)) return false;
+	return position == tag.size() || tag[position] == '-';
+}
+
+bool VersionIsNewer(const VersionNumber& candidate, const VersionNumber& current) {
+	if (candidate.major != current.major) return candidate.major > current.major;
+	if (candidate.minor != current.minor) return candidate.minor > current.minor;
+	return candidate.patch > current.patch;
+}
+
+std::string FindReleaseAssetUrl(
+	const std::string& json, size_t start, size_t end,
+	std::string_view expectedName
+) {
+	size_t cursor = start;
+	while (cursor < end) {
+		const size_t namePosition = json.find("\"name\"", cursor);
+		if (namePosition == std::string::npos || namePosition >= end) return {};
+		const std::string name = JsonStringAfter(json, "name", namePosition, end);
+		if (name == expectedName) {
+			return JsonStringAfter(json, "browser_download_url", namePosition, end);
+		}
+		cursor = namePosition + 6;
+	}
+	return {};
+}
+
+std::unique_ptr<UpdateWorkerResult> CheckForUpdateWorker() {
+	auto result = std::make_unique<UpdateWorkerResult>();
+	std::vector<uint8_t> body;
+	if (!HttpGet(GITHUB_RELEASES_API, 4 * 1024 * 1024, body, result->message)) {
+		return result;
+	}
+	const std::string json(body.begin(), body.end());
+	const VersionNumber current{ APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH };
+	VersionNumber best = current;
+	size_t cursor = 0;
+	while (true) {
+		const size_t tagPosition = json.find("\"tag_name\"", cursor);
+		if (tagPosition == std::string::npos) break;
+		const size_t nextTag = json.find("\"tag_name\"", tagPosition + 10);
+		const size_t releaseEnd = nextTag == std::string::npos ? json.size() : nextTag;
+		const std::string tag = JsonStringAfter(json, "tag_name", tagPosition, releaseEnd);
+		VersionNumber candidate{};
+		if (ParseReleaseVersion(tag, candidate) &&
+			VersionIsNewer(candidate, best)) {
+			best = candidate;
+			result->updateAvailable = true;
+			result->version = std::to_wstring(candidate.major) + L"." +
+				std::to_wstring(candidate.minor) + L"." + std::to_wstring(candidate.patch);
+			result->releaseUrl = std::wstring(GITHUB_REPOSITORY_URL) +
+				L"/releases/tag/" + Utf8ToWide(tag);
+			const std::string assetName = "DLSS5FloatingController-" +
+				std::to_string(candidate.major) + "." +
+				std::to_string(candidate.minor) + "." +
+				std::to_string(candidate.patch) + ".exe";
+			result->assetUrl = Utf8ToWide(FindReleaseAssetUrl(
+				json, tagPosition, releaseEnd, assetName));
+			result->hashUrl = Utf8ToWide(FindReleaseAssetUrl(
+				json, tagPosition, releaseEnd, assetName + ".sha256.txt"));
+		}
+		cursor = releaseEnd;
+	}
+	result->success = true;
+	if (!result->updateAvailable) result->message = L"已是最新版";
+	return result;
+}
+
+std::wstring Sha256Hex(const std::vector<uint8_t>& bytes) {
+	BCRYPT_ALG_HANDLE algorithm = nullptr;
+	BCRYPT_HASH_HANDLE hash = nullptr;
+	DWORD objectSize = 0;
+	DWORD resultSize = 0;
+	if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
+		BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+			reinterpret_cast<PUCHAR>(&objectSize), sizeof(objectSize), &resultSize, 0) < 0) {
+		if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+		return {};
+	}
+	std::vector<uint8_t> hashObject(objectSize);
+	std::array<uint8_t, 32> digest{};
+	if (BCryptCreateHash(algorithm, &hash, hashObject.data(), objectSize,
+		nullptr, 0, 0) < 0 ||
+		BCryptHashData(hash, const_cast<PUCHAR>(bytes.data()),
+			static_cast<ULONG>(bytes.size()), 0) < 0 ||
+		BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0) {
+		if (hash) BCryptDestroyHash(hash);
+		BCryptCloseAlgorithmProvider(algorithm, 0);
+		return {};
+	}
+	BCryptDestroyHash(hash);
+	BCryptCloseAlgorithmProvider(algorithm, 0);
+	constexpr wchar_t digits[] = L"0123456789abcdef";
+	std::wstring output;
+	output.reserve(64);
+	for (const uint8_t byte : digest) {
+		output.push_back(digits[byte >> 4]);
+		output.push_back(digits[byte & 0x0f]);
+	}
+	return output;
+}
+
+std::wstring FirstSha256(std::string_view text) {
+	std::wstring hash;
+	for (const unsigned char ch : text) {
+		const char lower = ch >= 'A' && ch <= 'F' ? static_cast<char>(ch - 'A' + 'a') : ch;
+		if ((lower >= '0' && lower <= '9') || (lower >= 'a' && lower <= 'f')) {
+			hash.push_back(static_cast<wchar_t>(lower));
+			if (hash.size() == 64) return hash;
+		} else if (!hash.empty()) {
+			hash.clear();
+		}
+	}
+	return {};
+}
+
+bool WriteBytes(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
+	std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+	if (!stream) return false;
+	stream.write(reinterpret_cast<const char*>(bytes.data()),
+		static_cast<std::streamsize>(bytes.size()));
+	return stream.good();
+}
+
+std::unique_ptr<UpdateWorkerResult> DownloadUpdateWorker(
+	std::wstring version, std::wstring assetUrl, std::wstring hashUrl,
+	std::wstring releaseUrl
+) {
+	auto result = std::make_unique<UpdateWorkerResult>();
+	result->download = true;
+	result->version = std::move(version);
+	result->releaseUrl = std::move(releaseUrl);
+	if (assetUrl.empty() || hashUrl.empty()) {
+		result->message = L"这个版本没有可自动安装的控制器附件";
+		return result;
+	}
+	std::vector<uint8_t> expectedBody;
+	if (!HttpGet(hashUrl, 64 * 1024, expectedBody, result->message)) return result;
+	const std::wstring expected = FirstSha256(std::string_view(
+		reinterpret_cast<const char*>(expectedBody.data()), expectedBody.size()));
+	if (expected.empty()) {
+		result->message = L"更新校验文件格式不正确";
+		return result;
+	}
+	std::vector<uint8_t> executable;
+	if (!HttpGet(assetUrl, 32 * 1024 * 1024, executable, result->message)) return result;
+	if (executable.size() < 2 || executable[0] != 'M' || executable[1] != 'Z') {
+		result->message = L"下载的更新不是有效的 Windows 程序";
+		return result;
+	}
+	const std::wstring actual = Sha256Hex(executable);
+	if (actual.empty() || actual != expected) {
+		result->message = L"更新文件 SHA-256 校验失败，已拒绝安装";
+		return result;
+	}
+	std::error_code pathError;
+	const std::filesystem::path tempDirectory = std::filesystem::temp_directory_path(pathError);
+	if (pathError) {
+		result->message = L"无法访问系统临时目录";
+		return result;
+	}
+	const std::filesystem::path destination = tempDirectory /
+		(L"DLSS5FloatingController-" + result->version + L"-" +
+			std::to_wstring(GetCurrentProcessId()) + L".exe");
+	if (!WriteBytes(destination, executable)) {
+		result->message = L"无法写入临时更新文件";
+		return result;
+	}
+	result->downloadedPath = destination.wstring();
+	result->success = true;
+	return result;
+}
+
+void PostWorkerResult(HWND hwnd, std::unique_ptr<UpdateWorkerResult> result) {
+	UpdateWorkerResult* raw = result.release();
+	if (!PostMessageW(hwnd, WM_UPDATE_WORKER_RESULT, 0,
+		reinterpret_cast<LPARAM>(raw))) delete raw;
+}
+
+void StartUpdateCheck(ControllerData& data) {
+	if (data.updateState == UpdateState::Checking ||
+		data.updateState == UpdateState::Downloading) return;
+	data.updateState = UpdateState::Checking;
+	data.updateMessage = L"正在连接 GitHub…";
+	InvalidateRect(data.hwnd, nullptr, FALSE);
+	const HWND hwnd = data.hwnd;
+	std::thread([hwnd] {
+		PostWorkerResult(hwnd, CheckForUpdateWorker());
+	}).detach();
+}
+
+void StartUpdateDownload(ControllerData& data) {
+	if (data.updateState != UpdateState::Available) return;
+	if (data.updateAssetUrl.empty() || data.updateHashUrl.empty()) {
+		ShellExecuteW(data.hwnd, L"open", data.updateReleaseUrl.c_str(),
+			nullptr, nullptr, SW_SHOWNORMAL);
+		return;
+	}
+	data.updateState = UpdateState::Downloading;
+	data.updateMessage = L"正在下载并校验控制器更新…";
+	InvalidateRect(data.hwnd, nullptr, FALSE);
+	const HWND hwnd = data.hwnd;
+	const std::wstring version = data.updateVersion;
+	const std::wstring assetUrl = data.updateAssetUrl;
+	const std::wstring hashUrl = data.updateHashUrl;
+	const std::wstring releaseUrl = data.updateReleaseUrl;
+	std::thread([hwnd, version, assetUrl, hashUrl, releaseUrl] {
+		PostWorkerResult(hwnd, DownloadUpdateWorker(
+			version, assetUrl, hashUrl, releaseUrl));
+	}).detach();
+}
+
+std::wstring ModulePath() {
+	std::wstring path(32768, L'\0');
+	const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+	if (!length || length >= path.size()) return {};
+	path.resize(length);
+	return path;
+}
+
+std::wstring EscapePowerShellLiteral(std::wstring_view value) {
+	std::wstring escaped;
+	escaped.reserve(value.size() + 8);
+	for (const wchar_t ch : value) {
+		escaped.push_back(ch);
+		if (ch == L'\'') escaped.push_back(L'\'');
+	}
+	return escaped;
+}
+
+bool WriteUtf8BomFile(const std::filesystem::path& path, std::wstring_view contents) {
+	const std::string utf8 = WideToUtf8(contents);
+	std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+	if (!stream) return false;
+	constexpr unsigned char bom[] = { 0xef, 0xbb, 0xbf };
+	stream.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+	stream.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+	return stream.good();
+}
+
+bool LaunchSelfUpdate(std::wstring_view downloadedPath, std::wstring& error) {
+	const std::wstring currentPath = ModulePath();
+	if (currentPath.empty() || !FileExists(std::filesystem::path(downloadedPath))) {
+		error = L"更新文件已经不存在";
+		return false;
+	}
+	std::error_code pathError;
+	const std::filesystem::path tempDirectory = std::filesystem::temp_directory_path(pathError);
+	if (pathError) {
+		error = L"无法访问系统临时目录";
+		return false;
+	}
+	const std::filesystem::path scriptPath = tempDirectory /
+		(L"DLSS5AnyWindowUpdate-" + std::to_wstring(GetCurrentProcessId()) + L".ps1");
+	const std::wstring currentDirectory =
+		std::filesystem::path(currentPath).parent_path().wstring();
+	const std::wstring source = EscapePowerShellLiteral(downloadedPath);
+	const std::wstring destination = EscapePowerShellLiteral(currentPath);
+	const std::wstring workingDirectory = EscapePowerShellLiteral(currentDirectory);
+	const std::wstring scriptLiteral = EscapePowerShellLiteral(scriptPath.wstring());
+	std::wstring script =
+		L"$ErrorActionPreference = 'SilentlyContinue'\r\n"
+		L"Wait-Process -Id " + std::to_wstring(GetCurrentProcessId()) +
+		L" -ErrorAction SilentlyContinue\r\n"
+		L"$copied = $false\r\n"
+		L"for ($i = 0; $i -lt 50 -and -not $copied; $i++) {\r\n"
+		L"  try { Copy-Item -LiteralPath '" + source + L"' -Destination '" +
+		destination + L"' -Force -ErrorAction Stop; $copied = $true }\r\n"
+		L"  catch { Start-Sleep -Milliseconds 200 }\r\n"
+		L"}\r\n"
+		L"if ($copied) { Start-Process -FilePath '" + destination +
+		L"' -WorkingDirectory '" + workingDirectory + L"' }\r\n"
+		L"Remove-Item -LiteralPath '" + source + L"' -Force -ErrorAction SilentlyContinue\r\n"
+		L"Remove-Item -LiteralPath '" + scriptLiteral + L"' -Force -ErrorAction SilentlyContinue\r\n";
+	if (!WriteUtf8BomFile(scriptPath, script)) {
+		error = L"无法创建更新辅助脚本";
+		return false;
+	}
+	wchar_t windowsDirectory[MAX_PATH]{};
+	if (!GetWindowsDirectoryW(windowsDirectory, MAX_PATH)) {
+		error = L"无法定位 Windows PowerShell";
+		return false;
+	}
+	const std::wstring powershell = std::wstring(windowsDirectory) +
+		L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+	std::wstring command = L"\"" + powershell +
+		L"\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
+		scriptPath.wstring() + L"\"";
+	STARTUPINFOW startup{ sizeof(startup) };
+	startup.dwFlags = STARTF_USESHOWWINDOW;
+	startup.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION process{};
+	if (!CreateProcessW(powershell.c_str(), command.data(), nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, nullptr,
+		currentDirectory.c_str(), &startup, &process)) {
+		error = L"无法启动更新安装程序（" + std::to_wstring(GetLastError()) + L"）";
+		DeleteFileW(scriptPath.c_str());
+		return false;
+	}
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	return true;
 }
 
 void UnregisterToggleHotkey(ControllerData& data) {
@@ -1089,8 +1641,8 @@ void DrawToggle(
 }
 
 void PaintSettingsTabs(HDC dc, const ControllerData& data) {
-	const wchar_t* labels[] = { L"滤镜", L"外观" };
-	for (int page = 0; page < 2; ++page) {
+	const wchar_t* labels[] = { L"滤镜", L"外观", L"关于" };
+	for (int page = 0; page < 3; ++page) {
 		RECT tab = SettingsTabRect(data, page);
 		if (data.settingsPage == page) {
 			FillPanel(dc, tab, WOOD_PANEL_DARK);
@@ -1099,6 +1651,99 @@ void PaintSettingsTabs(HDC dc, const ControllerData& data) {
 		DrawTextW(dc, labels[page], -1, &tab,
 			DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
+}
+
+std::wstring UpdateStatusText(const ControllerData& data) {
+	switch (data.updateState) {
+	case UpdateState::Checking:
+		return L"正在连接 GitHub…";
+	case UpdateState::Current:
+		return L"已是最新版 · " + std::wstring(APP_VERSION);
+	case UpdateState::Available:
+		return L"发现新版本 · " + data.updateVersion;
+	case UpdateState::Downloading:
+		return L"正在下载并验证更新…";
+	case UpdateState::Failed:
+		return data.updateMessage.empty() ? L"检查更新失败" : data.updateMessage;
+	case UpdateState::Idle:
+	default:
+		return L"尚未检查更新";
+	}
+}
+
+std::wstring UpdateActionText(const ControllerData& data) {
+	switch (data.updateState) {
+	case UpdateState::Checking: return L"正在检查…";
+	case UpdateState::Downloading: return L"正在下载…";
+	case UpdateState::Available:
+		return data.updateAssetUrl.empty() || data.updateHashUrl.empty()
+			? L"打开发布页面" : L"下载并安装";
+	default: return L"立即检查更新";
+	}
+}
+
+void PaintAboutSettings(HDC dc, ControllerData& data) {
+	RECT client{};
+	GetClientRect(data.hwnd, &client);
+	SelectObject(dc, data.statusFont);
+
+	SetTextColor(dc, PARCHMENT);
+	RECT product{ Dip(data, 19), Dip(data, 116), client.right - Dip(data, 19), Dip(data, 143) };
+	DrawTextW(dc, L"DLSS5 任意窗口滤镜", -1, &product,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	SetTextColor(dc, GOLD);
+	std::wstring version = L"当前版本  " + std::wstring(APP_VERSION);
+	RECT versionRect{ Dip(data, 19), Dip(data, 137), client.right - Dip(data, 19), Dip(data, 159) };
+	DrawTextW(dc, version.c_str(), -1, &versionRect,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+	DrawToggle(dc, data, L"启动时自动检查更新", 155,
+		data.uiSettings.autoCheckUpdates);
+
+	RECT statusCard{ Dip(data, 18), Dip(data, 202), client.right - Dip(data, 18), Dip(data, 246) };
+	FillPanel(dc, statusCard, WOOD_PANEL_DARK, WOOD_BORDER_LIGHT, WOOD_BORDER_DARK);
+	SetTextColor(dc, data.updateState == UpdateState::Failed ? CLAY_HOVER : PARCHMENT_MUTED);
+	RECT statusText = statusCard;
+	statusText.left += Dip(data, 12);
+	statusText.right -= Dip(data, 12);
+	const std::wstring updateStatus = UpdateStatusText(data);
+	DrawTextW(dc, updateStatus.c_str(), -1, &statusText,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+	RECT action = AboutUpdateActionRect(data);
+	const bool busy = data.updateState == UpdateState::Checking ||
+		data.updateState == UpdateState::Downloading;
+	FillPanel(dc, action, busy ? WOOD_TRACK : GOLD,
+		busy ? WOOD_BORDER_LIGHT : GOLD_HOVER,
+		busy ? WOOD_BORDER_DARK : GOLD_DARK);
+	SetTextColor(dc, busy ? PARCHMENT_DISABLED : WOOD_BORDER_DARK);
+	SelectObject(dc, data.buttonFont);
+	const std::wstring actionText = UpdateActionText(data);
+	DrawTextW(dc, actionText.c_str(), -1, &action,
+		DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+	SelectObject(dc, data.statusFont);
+	SetTextColor(dc, PARCHMENT_MUTED);
+	RECT safeHint{ Dip(data, 19), Dip(data, 309), client.right - Dip(data, 19), Dip(data, 337) };
+	DrawTextW(dc, L"只更新悬浮控制器，保留滤镜运行库、模型和设置", -1, &safeHint,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+	RECT source = AboutSourceLinkRect(data);
+	FillPanel(dc, source, WOOD_PANEL_DARK, WOOD_BORDER_LIGHT, WOOD_BORDER_DARK);
+	SetTextColor(dc, GOLD);
+	DrawTextW(dc, L"GitHub 源代码  ↗", -1, &source,
+		DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+	RECT author = AboutAuthorLinkRect(data);
+	FillPanel(dc, author, WOOD_PANEL_DARK, WOOD_BORDER_LIGHT, WOOD_BORDER_DARK);
+	SetTextColor(dc, GOLD);
+	DrawTextW(dc, L"作者主页  Shangyuwang11  ↗", -1, &author,
+		DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+	SetTextColor(dc, PARCHMENT_MUTED);
+	RECT linkHint{ Dip(data, 19), Dip(data, 447), client.right - Dip(data, 19), Dip(data, 493) };
+	DrawTextW(dc, L"更新通过 HTTPS 从项目 Release 获取，并校验 SHA-256。", -1, &linkHint,
+		DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
 }
 
 void PaintAppearanceSettings(HDC dc, ControllerData& data) {
@@ -1216,11 +1861,18 @@ void PaintSettingsPanel(HDC dc, ControllerData& data) {
 
 	SelectObject(dc, data.statusFont);
 	PaintSettingsTabs(dc, data);
-	SetTextColor(dc, GOLD);
-	RECT reset = ResetRect(data);
-	DrawTextW(dc, L"恢复默认", -1, &reset, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	if (data.settingsPage != 2) {
+		SetTextColor(dc, GOLD);
+		RECT reset = ResetRect(data);
+		DrawTextW(dc, L"恢复默认", -1, &reset,
+			DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	}
 	if (data.settingsPage == 1) {
 		PaintAppearanceSettings(dc, data);
+		return;
+	}
+	if (data.settingsPage == 2) {
+		PaintAboutSettings(dc, data);
 		return;
 	}
 
@@ -1564,7 +2216,7 @@ void UpdateSliderFromPoint(ControllerData& data, int index, POINT point) {
 
 bool HandleSettingsPress(ControllerData& data, POINT point) {
 	if (!data.settingsExpanded || data.phase != Phase::Idle) return false;
-	if (PointIn(ResetRect(data), point)) {
+	if (data.settingsPage != 2 && PointIn(ResetRect(data), point)) {
 		UnregisterControllerHotkeys(data);
 		data.hotkeyCapture = HotkeyCapture::None;
 		data.capturedHotkeyModifiers = 0;
@@ -1581,13 +2233,41 @@ bool HandleSettingsPress(ControllerData& data, POINT point) {
 		InvalidateRect(data.hwnd, nullptr, FALSE);
 		return true;
 	}
-	for (int page = 0; page < 2; ++page) {
+	for (int page = 0; page < 3; ++page) {
 		if (!PointIn(SettingsTabRect(data, page), point)) continue;
 		if (IsCapturingHotkey(data)) CancelHotkeyCapture(data);
 		data.settingsPage = page;
 		data.activeSlider = -1;
 		InvalidateRect(data.hwnd, nullptr, FALSE);
 		return true;
+	}
+	if (data.settingsPage == 2) {
+		if (PointIn(AboutAutoUpdateRect(data), point)) {
+			data.uiSettings.autoCheckUpdates = !data.uiSettings.autoCheckUpdates;
+			SaveSettings(data);
+			InvalidateRect(data.hwnd, nullptr, FALSE);
+			return true;
+		}
+		if (PointIn(AboutUpdateActionRect(data), point)) {
+			if (data.updateState == UpdateState::Available) {
+				StartUpdateDownload(data);
+			} else if (data.updateState != UpdateState::Checking &&
+				data.updateState != UpdateState::Downloading) {
+				StartUpdateCheck(data);
+			}
+			return true;
+		}
+		if (PointIn(AboutSourceLinkRect(data), point)) {
+			ShellExecuteW(data.hwnd, L"open", GITHUB_REPOSITORY_URL,
+				nullptr, nullptr, SW_SHOWNORMAL);
+			return true;
+		}
+		if (PointIn(AboutAuthorLinkRect(data), point)) {
+			ShellExecuteW(data.hwnd, L"open", GITHUB_AUTHOR_URL,
+				nullptr, nullptr, SW_SHOWNORMAL);
+			return true;
+		}
+		return point.y >= Dip(data, 76) && point.y < ButtonRect(data).top;
 	}
 	if (data.settingsPage == 1) {
 		if (PointIn(HotkeyRect(data), point)) {
@@ -1955,7 +2635,44 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 			data->targetTitle = L"一个或多个快捷键被占用，请在设置中更换";
 		}
 		SetTimer(hwnd, TIMER_POLL, 100, nullptr);
+		if (data->uiSettings.autoCheckUpdates) StartUpdateCheck(*data);
 		return 0;
+	case WM_UPDATE_WORKER_RESULT:
+	{
+		std::unique_ptr<UpdateWorkerResult> result(
+			reinterpret_cast<UpdateWorkerResult*>(lParam));
+		if (!result) return 0;
+		if (result->download) {
+			if (!result->success) {
+				data->updateState = UpdateState::Failed;
+				data->updateMessage = result->message;
+			} else {
+				std::wstring installError;
+				if (LaunchSelfUpdate(result->downloadedPath, installError)) {
+					DestroyWindow(hwnd);
+					return 0;
+				}
+				DeleteFileW(result->downloadedPath.c_str());
+				data->updateState = UpdateState::Failed;
+				data->updateMessage = std::move(installError);
+			}
+		} else if (!result->success) {
+			data->updateState = UpdateState::Failed;
+			data->updateMessage = result->message;
+		} else if (result->updateAvailable) {
+			data->updateState = UpdateState::Available;
+			data->updateVersion = std::move(result->version);
+			data->updateReleaseUrl = std::move(result->releaseUrl);
+			data->updateAssetUrl = std::move(result->assetUrl);
+			data->updateHashUrl = std::move(result->hashUrl);
+			data->updateMessage.clear();
+		} else {
+			data->updateState = UpdateState::Current;
+			data->updateMessage = L"已是最新版";
+		}
+		InvalidateRect(hwnd, nullptr, FALSE);
+		return 0;
+	}
 	case WM_DPICHANGED:
 		data->dpi = HIWORD(wParam);
 		RecreateFonts(*data);

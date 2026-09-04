@@ -1,1 +1,31 @@
+#pragma code_page(65001)
+
 101 ICON "..\\Magpie\\Magpie.ico"
+
+1 VERSIONINFO
+ FILEVERSION 1,9,0,0
+ PRODUCTVERSION 1,9,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Shangyuwang11"
+            VALUE "FileDescription", "DLSS5 任意窗口滤镜控制器"
+            VALUE "FileVersion", "1.9.0"
+            VALUE "InternalName", "DLSS5FloatingController"
+            VALUE "OriginalFilename", "DLSS5FloatingController.exe"
+            VALUE "ProductName", "DLSS5 AnyWindow"
+            VALUE "ProductVersion", "1.9.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
