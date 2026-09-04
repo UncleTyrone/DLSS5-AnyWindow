@@ -28,6 +28,7 @@ constexpr wchar_t INSTANCE_MUTEX_QA[] = L"Local\\DLSS5DoubleFloatingController.P
 constexpr wchar_t ENGINE_NAME[] = L"DLSSNRWindowDouble.exe";
 constexpr wchar_t SETTINGS_FILE[] = L"DLSS5-settings.ini";
 constexpr int TOGGLE_HOTKEY_ID = 0xD157;
+constexpr int VISIBILITY_HOTKEY_ID = 0xD158;
 constexpr DWORD ENGINE_EXIT_EXISTING_SCALING = 5;
 constexpr DWORD ENGINE_EXIT_ALREADY_RUNNING = 6;
 constexpr UINT_PTR TIMER_SELECT = 1;
@@ -121,20 +122,26 @@ enum class Phase {
 	Stopping
 };
 
+enum class HotkeyCapture {
+	None,
+	FilterToggle,
+	WindowVisibility
+};
+
 struct FilterSettings {
 	// 0 experimental DLSSNR, 1 stable single-frame CAS.
 	int backend = 0;
-	int style = 2;
+	int style = 0;
 	int intensity = 100;
 	int localTone = 100;
 	int localStructure = 100;
 	bool autoMask = true;
 	int passes = 1;
 	// 0 adaptive, 1 reset every source frame, 2 continuous history.
-	int historyMode = 0;
+	int historyMode = 2;
 	// 0 auto/available, 1 flat/zero, 2 motion only, 3 depth only.
-	int guidanceMode = 2;
-	int depthInferenceInterval = 4;
+	int guidanceMode = 3;
+	int depthInferenceInterval = 1;
 	UINT hotkeyModifiers = MOD_CONTROL | MOD_ALT;
 	UINT hotkeyVirtualKey = VK_F10;
 };
@@ -144,6 +151,8 @@ struct UiSettings {
 	int theme = 0;
 	// Layered-window alpha percentage. Keep a readable lower bound.
 	int opacity = 100;
+	UINT visibilityHotkeyModifiers = MOD_CONTROL | MOD_ALT;
+	UINT visibilityHotkeyVirtualKey = VK_F9;
 };
 
 struct ControllerData {
@@ -158,8 +167,9 @@ struct ControllerData {
 	int settingsPage = 0;
 	bool settingsHover = false;
 	bool settingsPressed = false;
-	bool capturingHotkey = false;
+	HotkeyCapture hotkeyCapture = HotkeyCapture::None;
 	bool hotkeyRegistered = false;
+	bool visibilityHotkeyRegistered = false;
 	UINT capturedHotkeyModifiers = 0;
 	int activeSlider = -1;
 	DWORD dpi = 96;
@@ -314,6 +324,12 @@ RECT HotkeyRect(const ControllerData& data) {
 	return { Dip(data, 130), Dip(data, 283), client.right - Dip(data, 18), Dip(data, 317) };
 }
 
+RECT VisibilityHotkeyRect(const ControllerData& data) {
+	RECT client{};
+	GetClientRect(data.hwnd, &client);
+	return { Dip(data, 130), Dip(data, 365), client.right - Dip(data, 18), Dip(data, 399) };
+}
+
 RECT ResetRect(const ControllerData& data) {
 	RECT client{};
 	GetClientRect(data.hwnd, &client);
@@ -396,7 +412,7 @@ void LoadSettings(ControllerData& data) {
 	data.settings.backend = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Backend", 0, path.c_str())), 0, 1);
 	data.settings.style = std::clamp(
-		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Style", 2, path.c_str())), 0, 2);
+		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Style", 0, path.c_str())), 0, 2);
 	data.settings.intensity = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Intensity", 100, path.c_str())), 0, 100);
 	data.settings.localTone = std::clamp(
@@ -412,15 +428,15 @@ void LoadSettings(ControllerData& data) {
 	} else {
 		const int legacyAntiFlicker = static_cast<int>(GetPrivateProfileIntW(
 			L"Filter", L"AntiFlicker", -1, path.c_str()));
-		data.settings.historyMode = legacyAntiFlicker < 0 ? 0 :
+		data.settings.historyMode = legacyAntiFlicker < 0 ? 2 :
 			(legacyAntiFlicker != 0 ? 1 : 2);
 	}
 	data.settings.passes = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Passes", 1, path.c_str())), 1, 4);
 	data.settings.guidanceMode = std::clamp(
-		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"GuidanceMode", 2, path.c_str())), 0, 3);
+		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"GuidanceMode", 3, path.c_str())), 0, 3);
 	data.settings.depthInferenceInterval = std::clamp(
-		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"DepthInferenceInterval", 4, path.c_str())), 1, 8);
+		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"DepthInferenceInterval", 1, path.c_str())), 1, 8);
 	data.settings.hotkeyModifiers = static_cast<UINT>(GetPrivateProfileIntW(
 		L"Filter", L"HotkeyModifiers", MOD_CONTROL | MOD_ALT, path.c_str())) &
 		(MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
@@ -432,6 +448,12 @@ void LoadSettings(ControllerData& data) {
 	data.uiSettings.opacity = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(L"UI", L"Opacity", 100, path.c_str())),
 		40, 100);
+	data.uiSettings.visibilityHotkeyModifiers = static_cast<UINT>(GetPrivateProfileIntW(
+		L"UI", L"VisibilityHotkeyModifiers", MOD_CONTROL | MOD_ALT, path.c_str())) &
+		(MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
+	data.uiSettings.visibilityHotkeyVirtualKey = static_cast<UINT>(std::clamp<int>(
+		GetPrivateProfileIntW(L"UI", L"VisibilityHotkeyVirtualKey", VK_F9, path.c_str()),
+		0, 0xff));
 	if (!GuidanceModeAvailable(data, data.settings.guidanceMode)) {
 		data.settings.guidanceMode = 1;
 	}
@@ -467,6 +489,10 @@ void SaveSettings(const ControllerData& data) {
 	SaveFilterSetting(path, L"HotkeyVirtualKey", static_cast<int>(data.settings.hotkeyVirtualKey));
 	SaveSetting(path, L"UI", L"Theme", data.uiSettings.theme);
 	SaveSetting(path, L"UI", L"Opacity", data.uiSettings.opacity);
+	SaveSetting(path, L"UI", L"VisibilityHotkeyModifiers",
+		static_cast<int>(data.uiSettings.visibilityHotkeyModifiers));
+	SaveSetting(path, L"UI", L"VisibilityHotkeyVirtualKey",
+		static_cast<int>(data.uiSettings.visibilityHotkeyVirtualKey));
 }
 
 void UnregisterToggleHotkey(ControllerData& data) {
@@ -483,6 +509,33 @@ bool RegisterToggleHotkey(ControllerData& data) {
 		data.settings.hotkeyModifiers | MOD_NOREPEAT,
 		data.settings.hotkeyVirtualKey) != FALSE;
 	return data.hotkeyRegistered;
+}
+
+void UnregisterVisibilityHotkey(ControllerData& data) {
+	if (!data.visibilityHotkeyRegistered) return;
+	UnregisterHotKey(data.hwnd, VISIBILITY_HOTKEY_ID);
+	data.visibilityHotkeyRegistered = false;
+}
+
+bool RegisterVisibilityHotkey(ControllerData& data) {
+	UnregisterVisibilityHotkey(data);
+	if (!data.uiSettings.visibilityHotkeyVirtualKey) return true;
+	data.visibilityHotkeyRegistered = RegisterHotKey(
+		data.hwnd, VISIBILITY_HOTKEY_ID,
+		data.uiSettings.visibilityHotkeyModifiers | MOD_NOREPEAT,
+		data.uiSettings.visibilityHotkeyVirtualKey) != FALSE;
+	return data.visibilityHotkeyRegistered;
+}
+
+void UnregisterControllerHotkeys(ControllerData& data) {
+	UnregisterToggleHotkey(data);
+	UnregisterVisibilityHotkey(data);
+}
+
+bool RegisterControllerHotkeys(ControllerData& data) {
+	const bool toggleRegistered = RegisterToggleHotkey(data);
+	const bool visibilityRegistered = RegisterVisibilityHotkey(data);
+	return toggleRegistered && visibilityRegistered;
 }
 
 bool IsModifierKey(UINT key) {
@@ -530,52 +583,74 @@ std::wstring VirtualKeyName(UINT key) {
 	return fallback;
 }
 
-std::wstring HotkeyText(const FilterSettings& settings) {
-	if (!settings.hotkeyVirtualKey) return L"未设置";
+std::wstring HotkeyText(UINT modifiers, UINT virtualKey) {
+	if (!virtualKey) return L"未设置";
 	std::wstring text;
 	auto append = [&text](const wchar_t* part) {
 		if (!text.empty()) text += L" + ";
 		text += part;
 	};
-	if (settings.hotkeyModifiers & MOD_CONTROL) append(L"Ctrl");
-	if (settings.hotkeyModifiers & MOD_ALT) append(L"Alt");
-	if (settings.hotkeyModifiers & MOD_SHIFT) append(L"Shift");
-	if (settings.hotkeyModifiers & MOD_WIN) append(L"Win");
-	const std::wstring keyName = VirtualKeyName(settings.hotkeyVirtualKey);
+	if (modifiers & MOD_CONTROL) append(L"Ctrl");
+	if (modifiers & MOD_ALT) append(L"Alt");
+	if (modifiers & MOD_SHIFT) append(L"Shift");
+	if (modifiers & MOD_WIN) append(L"Win");
+	const std::wstring keyName = VirtualKeyName(virtualKey);
 	append(keyName.c_str());
 	return text;
 }
 
-void BeginHotkeyCapture(ControllerData& data) {
+std::wstring HotkeyText(const FilterSettings& settings) {
+	return HotkeyText(settings.hotkeyModifiers, settings.hotkeyVirtualKey);
+}
+
+std::wstring VisibilityHotkeyText(const UiSettings& settings) {
+	return HotkeyText(
+		settings.visibilityHotkeyModifiers, settings.visibilityHotkeyVirtualKey);
+}
+
+bool IsCapturingHotkey(const ControllerData& data) {
+	return data.hotkeyCapture != HotkeyCapture::None;
+}
+
+void BeginHotkeyCapture(ControllerData& data, HotkeyCapture capture) {
 	if (data.phase != Phase::Idle) return;
-	UnregisterToggleHotkey(data);
-	data.capturingHotkey = true;
+	UnregisterControllerHotkeys(data);
+	data.hotkeyCapture = capture;
 	data.capturedHotkeyModifiers = 0;
-	data.targetTitle = L"请按新的组合键";
+	data.targetTitle = capture == HotkeyCapture::WindowVisibility
+		? L"请按新的浮窗隐藏/显示组合键" : L"请按新的滤镜开关组合键";
 	SetFocus(data.hwnd);
 	InvalidateRect(data.hwnd, nullptr, FALSE);
 }
 
 void CancelHotkeyCapture(ControllerData& data) {
-	if (!data.capturingHotkey) return;
-	data.capturingHotkey = false;
+	if (!IsCapturingHotkey(data)) return;
+	data.hotkeyCapture = HotkeyCapture::None;
 	data.capturedHotkeyModifiers = 0;
-	data.targetTitle = RegisterToggleHotkey(data) ? L"快捷键未更改" : L"原快捷键已被其他程序占用";
+	data.targetTitle = RegisterControllerHotkeys(data)
+		? L"快捷键未更改" : L"原快捷键中有组合键已被其他程序占用";
 	InvalidateRect(data.hwnd, nullptr, FALSE);
 }
 
 void CommitHotkeyCapture(ControllerData& data, UINT key) {
-	if (!data.capturingHotkey) return;
+	if (!IsCapturingHotkey(data)) return;
 	if (key == VK_ESCAPE) {
 		CancelHotkeyCapture(data);
 		return;
 	}
+	const HotkeyCapture capture = data.hotkeyCapture;
+	UINT& configuredModifiers = capture == HotkeyCapture::WindowVisibility
+		? data.uiSettings.visibilityHotkeyModifiers : data.settings.hotkeyModifiers;
+	UINT& configuredKey = capture == HotkeyCapture::WindowVisibility
+		? data.uiSettings.visibilityHotkeyVirtualKey : data.settings.hotkeyVirtualKey;
 	if (key == VK_BACK || key == VK_DELETE) {
-		data.settings.hotkeyModifiers = 0;
-		data.settings.hotkeyVirtualKey = 0;
-		data.capturingHotkey = false;
+		configuredModifiers = 0;
+		configuredKey = 0;
+		data.hotkeyCapture = HotkeyCapture::None;
 		data.capturedHotkeyModifiers = 0;
-		data.targetTitle = L"全局快捷键已停用";
+		RegisterControllerHotkeys(data);
+		data.targetTitle = capture == HotkeyCapture::WindowVisibility
+			? L"浮窗快捷键已停用" : L"滤镜快捷键已停用";
 		SaveSettings(data);
 		InvalidateRect(data.hwnd, nullptr, FALSE);
 		return;
@@ -591,19 +666,21 @@ void CommitHotkeyCapture(ControllerData& data, UINT key) {
 		InvalidateRect(data.hwnd, nullptr, FALSE);
 		return;
 	}
-	const UINT oldModifiers = data.settings.hotkeyModifiers;
-	const UINT oldKey = data.settings.hotkeyVirtualKey;
-	data.settings.hotkeyModifiers = modifiers;
-	data.settings.hotkeyVirtualKey = key;
-	data.capturingHotkey = false;
+	const UINT oldModifiers = configuredModifiers;
+	const UINT oldKey = configuredKey;
+	configuredModifiers = modifiers;
+	configuredKey = key;
+	data.hotkeyCapture = HotkeyCapture::None;
 	data.capturedHotkeyModifiers = 0;
-	if (RegisterToggleHotkey(data)) {
+	if (RegisterControllerHotkeys(data)) {
 		SaveSettings(data);
-		data.targetTitle = L"快捷键已改为 " + HotkeyText(data.settings);
+		data.targetTitle = (capture == HotkeyCapture::WindowVisibility
+			? L"浮窗快捷键已改为 " : L"滤镜快捷键已改为 ") +
+			HotkeyText(configuredModifiers, configuredKey);
 	} else {
-		data.settings.hotkeyModifiers = oldModifiers;
-		data.settings.hotkeyVirtualKey = oldKey;
-		RegisterToggleHotkey(data);
+		configuredModifiers = oldModifiers;
+		configuredKey = oldKey;
+		RegisterControllerHotkeys(data);
 		data.targetTitle = L"这个组合键已被占用，已恢复原设置";
 	}
 	InvalidateRect(data.hwnd, nullptr, FALSE);
@@ -1076,15 +1153,17 @@ void PaintAppearanceSettings(HDC dc, ControllerData& data) {
 
 	SetTextColor(dc, PARCHMENT);
 	RECT hotkeyLabel{ Dip(data, 19), Dip(data, 283), Dip(data, 124), Dip(data, 317) };
-	DrawTextW(dc, L"开关快捷键", -1, &hotkeyLabel,
+	DrawTextW(dc, L"滤镜快捷键", -1, &hotkeyLabel,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	RECT hotkey = HotkeyRect(data);
+	const bool capturingFilterHotkey =
+		data.hotkeyCapture == HotkeyCapture::FilterToggle;
 	FillPanel(dc, hotkey,
-		data.capturingHotkey ? GOLD_DARK : WOOD_PANEL_DARK,
-		data.capturingHotkey ? GOLD_HOVER : WOOD_BORDER_LIGHT,
+		capturingFilterHotkey ? GOLD_DARK : WOOD_PANEL_DARK,
+		capturingFilterHotkey ? GOLD_HOVER : WOOD_BORDER_LIGHT,
 		WOOD_BORDER_DARK);
-	SetTextColor(dc, data.capturingHotkey ? PARCHMENT : GOLD);
-	const std::wstring hotkeyValue = data.capturingHotkey
+	SetTextColor(dc, capturingFilterHotkey ? PARCHMENT : GOLD);
+	const std::wstring hotkeyValue = capturingFilterHotkey
 		? L"> 按下组合键 <" : HotkeyText(data.settings);
 	DrawTextW(dc, hotkeyValue.c_str(), -1, &hotkey,
 		DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -1094,8 +1173,32 @@ void PaintAppearanceSettings(HDC dc, ControllerData& data) {
 	DrawTextW(dc, L"点击录入 · Esc 取消 · Backspace 停用", -1, &hotkeyHint,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
+	SetTextColor(dc, PARCHMENT);
+	RECT visibilityHotkeyLabel{
+		Dip(data, 19), Dip(data, 365), Dip(data, 124), Dip(data, 399) };
+	DrawTextW(dc, L"隐藏浮窗", -1, &visibilityHotkeyLabel,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	RECT visibilityHotkey = VisibilityHotkeyRect(data);
+	const bool capturingVisibilityHotkey =
+		data.hotkeyCapture == HotkeyCapture::WindowVisibility;
+	FillPanel(dc, visibilityHotkey,
+		capturingVisibilityHotkey ? GOLD_DARK : WOOD_PANEL_DARK,
+		capturingVisibilityHotkey ? GOLD_HOVER : WOOD_BORDER_LIGHT,
+		WOOD_BORDER_DARK);
+	SetTextColor(dc, capturingVisibilityHotkey ? PARCHMENT : GOLD);
+	const std::wstring visibilityHotkeyValue = capturingVisibilityHotkey
+		? L"> 按下组合键 <" : VisibilityHotkeyText(data.uiSettings);
+	DrawTextW(dc, visibilityHotkeyValue.c_str(), -1, &visibilityHotkey,
+		DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+	SetTextColor(dc, PARCHMENT_MUTED);
+	RECT visibilityHotkeyHint{
+		Dip(data, 19), Dip(data, 404), client.right - Dip(data, 19), Dip(data, 427) };
+	DrawTextW(dc, L"隐藏后滤镜继续运行，再按一次恢复浮窗", -1, &visibilityHotkeyHint,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
 	SetTextColor(dc, GOLD);
-	RECT liveHint{ Dip(data, 19), Dip(data, 375), client.right - Dip(data, 19), Dip(data, 399) };
+	RECT liveHint{ Dip(data, 19), Dip(data, 457), client.right - Dip(data, 19), Dip(data, 481) };
 	DrawTextW(dc, L"配色与透明度会即时预览并自动保存", -1, &liveHint,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
@@ -1433,7 +1536,7 @@ void ToggleSettings(ControllerData& data) {
 		InvalidateRect(data.hwnd, nullptr, FALSE);
 		return;
 	}
-	if (data.settingsExpanded && data.capturingHotkey) {
+	if (data.settingsExpanded && IsCapturingHotkey(data)) {
 		CancelHotkeyCapture(data);
 	}
 	data.settingsExpanded = !data.settingsExpanded;
@@ -1462,8 +1565,8 @@ void UpdateSliderFromPoint(ControllerData& data, int index, POINT point) {
 bool HandleSettingsPress(ControllerData& data, POINT point) {
 	if (!data.settingsExpanded || data.phase != Phase::Idle) return false;
 	if (PointIn(ResetRect(data), point)) {
-		UnregisterToggleHotkey(data);
-		data.capturingHotkey = false;
+		UnregisterControllerHotkeys(data);
+		data.hotkeyCapture = HotkeyCapture::None;
 		data.capturedHotkeyModifiers = 0;
 		data.settings = {};
 		data.uiSettings = {};
@@ -1473,14 +1576,14 @@ bool HandleSettingsPress(ControllerData& data, POINT point) {
 		ApplyUiPalette(data.uiSettings.theme);
 		ApplyWindowOpacity(data);
 		SaveSettings(data);
-		data.targetTitle = RegisterToggleHotkey(data)
-			? L"已恢复默认设置" : L"默认快捷键被其他程序占用";
+		data.targetTitle = RegisterControllerHotkeys(data)
+			? L"已恢复默认设置" : L"一个或多个默认快捷键被其他程序占用";
 		InvalidateRect(data.hwnd, nullptr, FALSE);
 		return true;
 	}
 	for (int page = 0; page < 2; ++page) {
 		if (!PointIn(SettingsTabRect(data, page), point)) continue;
-		if (data.capturingHotkey) CancelHotkeyCapture(data);
+		if (IsCapturingHotkey(data)) CancelHotkeyCapture(data);
 		data.settingsPage = page;
 		data.activeSlider = -1;
 		InvalidateRect(data.hwnd, nullptr, FALSE);
@@ -1488,7 +1591,11 @@ bool HandleSettingsPress(ControllerData& data, POINT point) {
 	}
 	if (data.settingsPage == 1) {
 		if (PointIn(HotkeyRect(data), point)) {
-			BeginHotkeyCapture(data);
+			BeginHotkeyCapture(data, HotkeyCapture::FilterToggle);
+			return true;
+		}
+		if (PointIn(VisibilityHotkeyRect(data), point)) {
+			BeginHotkeyCapture(data, HotkeyCapture::WindowVisibility);
 			return true;
 		}
 		if (PointIn(UiThemeRect(data), point)) {
@@ -1802,10 +1909,21 @@ void PollEngine(ControllerData& data) {
 	}
 }
 
+void ToggleControllerVisibility(ControllerData& data) {
+	if (IsWindowVisible(data.hwnd)) {
+		ShowWindow(data.hwnd, SW_HIDE);
+		return;
+	}
+	ShowWindow(data.hwnd, SW_SHOWNOACTIVATE);
+	SetWindowPos(data.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+	InvalidateRect(data.hwnd, nullptr, FALSE);
+}
+
 void ShutdownController(ControllerData& data) {
 	KillTimer(data.hwnd, TIMER_SELECT);
 	KillTimer(data.hwnd, TIMER_POLL);
-	UnregisterToggleHotkey(data);
+	UnregisterControllerHotkeys(data);
 	if (data.child.hProcess) {
 		if (data.stopEvent) SetEvent(data.stopEvent);
 		if (WaitForSingleObject(data.child.hProcess, 3000) != WAIT_OBJECT_0) {
@@ -1833,8 +1951,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 		LoadSettings(*data);
 		ApplyWindowOpacity(*data);
 		RecreateFonts(*data);
-		if (!RegisterToggleHotkey(*data)) {
-			data->targetTitle = L"快捷键被其他程序占用，请在设置中更换";
+		if (!RegisterControllerHotkeys(*data)) {
+			data->targetTitle = L"一个或多个快捷键被占用，请在设置中更换";
 		}
 		SetTimer(hwnd, TIMER_POLL, 100, nullptr);
 		return 0;
@@ -1891,8 +2009,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 	case WM_LBUTTONDOWN:
 	{
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-		if (data->capturingHotkey && !PointIn(HotkeyRect(*data), point)) {
-			CancelHotkeyCapture(*data);
+		if (IsCapturingHotkey(*data)) {
+			const RECT captureRect = data->hotkeyCapture == HotkeyCapture::WindowVisibility
+				? VisibilityHotkeyRect(*data) : HotkeyRect(*data);
+			if (!PointIn(captureRect, point)) CancelHotkeyCapture(*data);
 		}
 		data->buttonPressed = PointIn(ButtonRect(*data), point);
 		data->closePressed = PointIn(CloseRect(*data), point);
@@ -1929,7 +2049,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 	}
 	case WM_KEYDOWN:
 	case WM_SYSKEYDOWN:
-		if (data->capturingHotkey) {
+		if (IsCapturingHotkey(*data)) {
 			CommitHotkeyCapture(*data, static_cast<UINT>(wParam));
 		} else if (wParam == VK_SPACE || wParam == VK_RETURN) ActivateButton(*data);
 		else if (wParam == VK_ESCAPE) {
@@ -1939,18 +2059,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 		return 0;
 	case WM_KEYUP:
 	case WM_SYSKEYUP:
-		if (data->capturingHotkey && IsModifierKey(static_cast<UINT>(wParam))) {
+		if (IsCapturingHotkey(*data) && IsModifierKey(static_cast<UINT>(wParam))) {
 			data->capturedHotkeyModifiers &= ~ModifierFlagForKey(static_cast<UINT>(wParam));
 		}
 		return 0;
 	case WM_HOTKEY:
-		if (wParam == TOGGLE_HOTKEY_ID && !data->capturingHotkey) {
+		if (wParam == TOGGLE_HOTKEY_ID && !IsCapturingHotkey(*data)) {
 			ActivateButton(*data);
+			return 0;
+		}
+		if (wParam == VISIBILITY_HOTKEY_ID && !IsCapturingHotkey(*data)) {
+			ToggleControllerVisibility(*data);
 			return 0;
 		}
 		break;
 	case WM_ACTIVATE:
-		if (LOWORD(wParam) == WA_INACTIVE && data->capturingHotkey) {
+		if (LOWORD(wParam) == WA_INACTIVE && IsCapturingHotkey(*data)) {
 			CancelHotkeyCapture(*data);
 		}
 		return 0;
