@@ -1774,7 +1774,7 @@ bool DLSSNRFilter::Initialize(
 	} initStatus;
 	_settings = settings;
 	_settings.processingResolutionPercent = std::clamp(
-		_settings.processingResolutionPercent, 50u, 100u);
+		_settings.processingResolutionPercent, 25u, 100u);
 	_impl.reset();
 	FrameGuidancePerformance::ResetDlssnrGpuTiming();
 	auto impl = std::make_unique<Impl>();

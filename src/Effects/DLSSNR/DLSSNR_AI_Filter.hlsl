@@ -8,7 +8,7 @@
 //!PARAMETER
 //!LABEL Processing Resolution (%)
 //!DEFAULT 100
-//!MIN 50
+//!MIN 25
 //!MAX 100
 //!STEP 1
 int processingResolutionPercent;

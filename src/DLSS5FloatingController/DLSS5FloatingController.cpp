@@ -33,10 +33,10 @@ constexpr wchar_t INSTANCE_MUTEX[] = L"Local\\DLSS5DoubleFloatingController.Sing
 constexpr wchar_t INSTANCE_MUTEX_QA[] = L"Local\\DLSS5DoubleFloatingController.PixelQaInstance";
 constexpr wchar_t ENGINE_NAME[] = L"DLSSNRWindowDouble.exe";
 constexpr wchar_t SETTINGS_FILE[] = L"DLSS5-settings.ini";
-constexpr wchar_t APP_VERSION[] = L"1.9.0";
+constexpr wchar_t APP_VERSION[] = L"1.9.1";
 constexpr int APP_VERSION_MAJOR = 1;
 constexpr int APP_VERSION_MINOR = 9;
-constexpr int APP_VERSION_PATCH = 0;
+constexpr int APP_VERSION_PATCH = 1;
 constexpr wchar_t GITHUB_REPOSITORY_URL[] =
 	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow";
 constexpr wchar_t GITHUB_RELEASES_API[] =
@@ -355,7 +355,7 @@ RECT BackendRect(const ControllerData& data) {
 RECT ProcessingResolutionRect(const ControllerData& data) {
 	RECT client{};
 	GetClientRect(data.hwnd, &client);
-	return { Dip(data, 150), Dip(data, 621), client.right - Dip(data, 18), Dip(data, 653) };
+	return { Dip(data, 124), Dip(data, 621), client.right - Dip(data, 18), Dip(data, 653) };
 }
 
 RECT SettingsTabRect(const ControllerData& data, int page) {
@@ -488,7 +488,7 @@ void LoadSettings(ControllerData& data) {
 		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Backend", 0, path.c_str())), 0, 1);
 	data.settings.processingResolutionPercent = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(
-			L"Filter", L"ProcessingResolutionPercent", 100, path.c_str())), 50, 100);
+			L"Filter", L"ProcessingResolutionPercent", 100, path.c_str())), 25, 100);
 	data.settings.style = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Style", 0, path.c_str())), 0, 2);
 	data.settings.intensity = std::clamp(
@@ -623,7 +623,7 @@ bool HttpGet(
 	if (resource.empty()) resource = L"/";
 
 	HINTERNET session = WinHttpOpen(
-		L"DLSS5-AnyWindow-Updater/1.9.0",
+		L"DLSS5-AnyWindow-Updater/1.9.1",
 		WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
 		WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!session) {
@@ -2037,16 +2037,18 @@ void PaintSettingsPanel(HDC dc, ControllerData& data) {
 	}
 
 	SetTextColor(dc, experimental ? PARCHMENT : PARCHMENT_DISABLED);
-	RECT resolutionLabel{ Dip(data, 19), Dip(data, 621), Dip(data, 144), Dip(data, 653) };
-	DrawTextW(dc, L"处理分辨率", -1, &resolutionLabel,
+	RECT resolutionLabel{ Dip(data, 19), Dip(data, 621), Dip(data, 120), Dip(data, 653) };
+	DrawTextW(dc, L"处理分辨率 %", -1, &resolutionLabel,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	RECT resolution = ProcessingResolutionRect(data);
 	FillPanel(dc, resolution, WOOD_PANEL_DARK);
-	constexpr int resolutionValues[] = { 100, 75, 67, 50 };
-	const int resolutionSegmentWidth = (resolution.right - resolution.left) / 4;
-	for (int index = 0; index < 4; ++index) {
+	constexpr int resolutionValues[] = { 100, 75, 67, 50, 33, 25 };
+	constexpr int resolutionValueCount = static_cast<int>(std::size(resolutionValues));
+	const int resolutionSegmentWidth =
+		(resolution.right - resolution.left) / resolutionValueCount;
+	for (int index = 0; index < resolutionValueCount; ++index) {
 		RECT segment{ resolution.left + resolutionSegmentWidth * index, resolution.top,
-			index == 3 ? resolution.right :
+			index == resolutionValueCount - 1 ? resolution.right :
 				resolution.left + resolutionSegmentWidth * (index + 1), resolution.bottom };
 		const bool selected = experimental &&
 			data.settings.processingResolutionPercent == resolutionValues[index];
@@ -2057,13 +2059,13 @@ void PaintSettingsPanel(HDC dc, ControllerData& data) {
 		}
 		SetTextColor(dc, !experimental ? PARCHMENT_DISABLED :
 			(selected ? WOOD_BORDER_DARK : PARCHMENT_MUTED));
-		const std::wstring text = std::to_wstring(resolutionValues[index]) + L"%";
+		const std::wstring text = std::to_wstring(resolutionValues[index]);
 		DrawTextW(dc, text.c_str(), -1, &segment,
 			DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
 	SetTextColor(dc, experimental ? PARCHMENT_MUTED : PARCHMENT_DISABLED);
 	RECT resolutionHint{ Dip(data, 19), Dip(data, 655), client.right - Dip(data, 19), Dip(data, 679) };
-	DrawTextW(dc, L"只降低内部计算量；输出尺寸与窗口位置不变", -1, &resolutionHint,
+	DrawTextW(dc, L"≤33% 为极限档；输出尺寸、窗口位置不变", -1, &resolutionHint,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
 }
@@ -2428,11 +2430,13 @@ bool HandleSettingsPress(ControllerData& data, POINT point) {
 		return true;
 	}
 	if (PointIn(ProcessingResolutionRect(data), point)) {
-		constexpr int values[] = { 100, 75, 67, 50 };
+		constexpr int values[] = { 100, 75, 67, 50, 33, 25 };
 		const RECT rect = ProcessingResolutionRect(data);
 		const int rectWidth = std::max(1, static_cast<int>(rect.right - rect.left));
+		constexpr int valueCount = static_cast<int>(std::size(values));
 		const int index = std::clamp(
-			static_cast<int>(point.x - rect.left) * 4 / rectWidth, 0, 3);
+			static_cast<int>(point.x - rect.left) * valueCount / rectWidth,
+			0, valueCount - 1);
 		data.settings.processingResolutionPercent = values[index];
 		SaveSettings(data);
 		InvalidateRect(data.hwnd, nullptr, FALSE);

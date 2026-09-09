@@ -68,7 +68,7 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 		DLSSNRSettings settings{
 			.processingResolutionPercent = static_cast<uint32_t>(std::clamp(
 				static_cast<int>(std::lround(
-					getParameter("processingResolutionPercent", 100.0f))), 50, 100)),
+					getParameter("processingResolutionPercent", 100.0f))), 25, 100)),
 			.style = std::clamp(
 				static_cast<int>(std::lround(getParameter("style", 0.0f))), 0, 2),
 			.intensity = std::clamp(getParameter("intensity", 1.0f), 0.0f, 1.0f),

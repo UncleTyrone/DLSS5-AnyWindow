@@ -132,7 +132,7 @@ Arguments ParseArguments() {
 		} else if (arg == L"--processing-resolution" && i + 1 < argc) {
 			if (auto value = ParseUnsigned(argv.get()[++i])) {
 				result.processingResolutionPercent = static_cast<int>(
-					std::clamp<unsigned long long>(*value, 50, 100));
+					std::clamp<unsigned long long>(*value, 25, 100));
 			}
 		} else if (arg == L"--intensity" && i + 1 < argc) {
 			if (auto value = ParseFloat(argv.get()[++i])) {
