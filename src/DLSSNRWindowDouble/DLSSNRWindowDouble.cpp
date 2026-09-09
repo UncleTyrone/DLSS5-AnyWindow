@@ -52,6 +52,7 @@ struct Arguments {
 	DWORD controllerPid = 0;
 	// 0 experimental DLSSNR, 1 stable single-frame CAS.
 	int backend = 0;
+	int processingResolutionPercent = 100;
 	int style = 2;
 	float intensity = 1.0f;
 	float localToneStrength = 1.0f;
@@ -127,6 +128,11 @@ Arguments ParseArguments() {
 		} else if (arg == L"--style" && i + 1 < argc) {
 			if (auto value = ParseUnsigned(argv.get()[++i])) {
 				result.style = static_cast<int>(std::min<unsigned long long>(*value, 2));
+			}
+		} else if (arg == L"--processing-resolution" && i + 1 < argc) {
+			if (auto value = ParseUnsigned(argv.get()[++i])) {
+				result.processingResolutionPercent = static_cast<int>(
+					std::clamp<unsigned long long>(*value, 50, 100));
 			}
 		} else if (arg == L"--intensity" && i + 1 < argc) {
 			if (auto value = ParseFloat(argv.get()[++i])) {
@@ -247,6 +253,8 @@ ScalingOptions MakeOptions(const Arguments& args) {
 		}
 		effect.name = "DLSSNR\\DLSSNR_AI_Filter";
 		effect.parameters = {
+			{ "processingResolutionPercent",
+				static_cast<float>(args.processingResolutionPercent) },
 			{ "style", static_cast<float>(args.style) },
 			{ "intensity", args.intensity },
 			{ "localToneStrength", args.localToneStrength },
@@ -257,7 +265,9 @@ ScalingOptions MakeOptions(const Arguments& args) {
 			{ "passes", static_cast<float>(args.passes) },
 			{ "historyMode", static_cast<float>(args.historyMode) }
 		};
-		Logger::Get().Info("Renderer backend=experimental-dlssnr");
+		Logger::Get().Info(fmt::format(
+			"Renderer backend=experimental-dlssnr processingResolution={}%",
+			args.processingResolutionPercent));
 	}
 	options.effects.push_back(std::move(effect));
 	options.captureMethod = CaptureMethod::GraphicsCapture;

@@ -6,6 +6,14 @@
 //!SORT_NAME DLSSNR AI Filter (Experimental)
 
 //!PARAMETER
+//!LABEL Processing Resolution (%)
+//!DEFAULT 100
+//!MIN 50
+//!MAX 100
+//!STEP 1
+int processingResolutionPercent;
+
+//!PARAMETER
 //!LABEL NR Style (0 Default, 1 Natural, 2 Cinematic)
 //!DEFAULT 0
 //!MIN 0

@@ -1,5 +1,12 @@
 # DLSS5 AnyWindow 1.9.0 — Automatic Updates and Project Links
 
+## 处理分辨率
+
+- 滤镜页新增 `100% / 75% / 67% / 50%` 四档内部处理分辨率，默认 `100%`。
+- 该选项只改变 DLSS5 / DLSSNR 的内部输入、帧引导和残差计算尺寸；目标窗口、覆盖层和最终输出尺寸均保持不变。
+- 降分辨率路径使用 Lanczos-2 缩小原图，处理后只放大并合成 DLSSNR 残差，避免把整张低分辨率画面直接拉伸回去。
+- `CAS SHARPEN` 不使用此选项。低档位可降低高分辨率动态画面的 GPU 压力，但会牺牲部分细节；画质优先仍建议 `100%`。
+
 ## 自动更新
 
 - 悬浮控制器新增“关于”页，默认在启动时后台检查 GitHub Release。
@@ -26,4 +33,4 @@
 
 ## English summary
 
-The floating controller now has an About page, non-blocking GitHub Release checks, explicit user-confirmed self-update, SHA-256 verification, the repository link, and two-key shortcut capture. The updater replaces only the controller executable and preserves all user settings, models, and local rendering runtimes.
+The floating controller now has an About page, non-blocking GitHub Release checks, explicit user-confirmed self-update, SHA-256 verification, the repository link, two-key shortcut capture, and a 100/75/67/50 percent internal DLSSNR processing-resolution selector. The updater replaces only the controller executable and preserves all user settings, models, and local rendering runtimes.

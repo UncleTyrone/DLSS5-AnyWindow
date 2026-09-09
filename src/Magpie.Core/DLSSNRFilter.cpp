@@ -141,6 +141,231 @@ void ConvertToRgba(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+constexpr char COLOR_DOWNSAMPLE_HLSL[] = R"(
+Texture2D<float4> InputColor : register(t0);
+RWTexture2D<float4> OutputColor : register(u0);
+
+cbuffer ResampleParams : register(b0) {
+    uint2 SourceExtent;
+    uint2 TargetExtent;
+    float2 MotionScale;
+    float2 Padding;
+};
+
+float Sinc(float x) {
+    if (abs(x) < 1e-5) return 1.0;
+    x *= 3.14159265358979323846;
+    return sin(x) / x;
+}
+
+float Lanczos2(float x) {
+    return abs(x) < 2.0 ? Sinc(x) * Sinc(x * 0.5) : 0.0;
+}
+
+[numthreads(8, 8, 1)]
+void DownsampleColorVertical(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= SourceExtent.x || tid.y >= TargetExtent.y) return;
+    float scale = float(TargetExtent.y) / float(SourceExtent.y);
+    float position = (float(tid.y) + 0.5) / scale - 0.5;
+    float support = 2.0 / scale;
+    int first = int(ceil(position - support));
+    int last = int(floor(position + support));
+    float4 total = 0.0;
+    float totalWeight = 0.0;
+    [loop]
+    for (int y = first; y <= last; ++y) {
+        float weight = Lanczos2((float(y) - position) * scale);
+        total += InputColor.Load(int3(tid.x,
+            clamp(y, 0, int(SourceExtent.y) - 1), 0)) * weight;
+        totalWeight += weight;
+    }
+    OutputColor[tid.xy] = total / (abs(totalWeight) > 1e-6 ? totalWeight : 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void DownsampleColorHorizontal(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= TargetExtent)) return;
+    float scale = float(TargetExtent.x) / float(SourceExtent.x);
+    float position = (float(tid.x) + 0.5) / scale - 0.5;
+    float support = 2.0 / scale;
+    int first = int(ceil(position - support));
+    int last = int(floor(position + support));
+    float4 total = 0.0;
+    float totalWeight = 0.0;
+    [loop]
+    for (int x = first; x <= last; ++x) {
+        float weight = Lanczos2((float(x) - position) * scale);
+        total += InputColor.Load(int3(
+            clamp(x, 0, int(SourceExtent.x) - 1), tid.y, 0)) * weight;
+        totalWeight += weight;
+    }
+    OutputColor[tid.xy] = total / (abs(totalWeight) > 1e-6 ? totalWeight : 1.0);
+}
+)";
+
+constexpr char GUIDANCE_DOWNSAMPLE_HLSL[] = R"(
+Texture2D<float2> InputMotion : register(t0);
+Texture2D<float> InputDepth : register(t1);
+Texture2D<float> InputConfidence : register(t2);
+RWTexture2D<float2> OutputMotion : register(u0);
+RWTexture2D<float> OutputDepth : register(u1);
+RWTexture2D<float> OutputConfidence : register(u2);
+
+cbuffer ResampleParams : register(b0) {
+    uint2 SourceExtent;
+    uint2 TargetExtent;
+    float2 MotionScale;
+    float2 Padding;
+};
+
+[numthreads(8, 8, 1)]
+void DownsampleGuidance(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= TargetExtent)) return;
+    float2 sourceStart = float2(tid.xy) * float2(SourceExtent) / float2(TargetExtent);
+    float2 sourceEnd = float2(tid.xy + 1) * float2(SourceExtent) / float2(TargetExtent);
+    int2 first = int2(floor(sourceStart));
+    int2 last = int2(ceil(sourceEnd));
+    float2 motionTotal = 0.0;
+    float2 weightedMotionTotal = 0.0;
+    float confidenceTotal = 0.0;
+    float totalWeight = 0.0;
+    float closestDepth = 0.0;
+    [loop]
+    for (int y = first.y; y < last.y; ++y) {
+        float weightY = max(0.0, min(sourceEnd.y, float(y + 1)) - max(sourceStart.y, float(y)));
+        [loop]
+        for (int x = first.x; x < last.x; ++x) {
+            float weightX = max(0.0, min(sourceEnd.x, float(x + 1)) - max(sourceStart.x, float(x)));
+            float weight = weightX * weightY;
+            int2 sourcePixel = clamp(int2(x, y), int2(0, 0), int2(SourceExtent) - 1);
+            float2 motion = InputMotion.Load(int3(sourcePixel, 0));
+            float confidence = InputConfidence.Load(int3(sourcePixel, 0));
+            motionTotal += motion * weight;
+            weightedMotionTotal += motion * confidence * weight;
+            confidenceTotal += confidence * weight;
+            totalWeight += weight;
+            closestDepth = max(closestDepth, InputDepth.Load(int3(sourcePixel, 0)));
+        }
+    }
+    float2 motion = confidenceTotal > 1e-6 ?
+        weightedMotionTotal / confidenceTotal : motionTotal / max(totalWeight, 1e-6);
+    OutputMotion[tid.xy] = motion * MotionScale;
+    OutputDepth[tid.xy] = closestDepth;
+    OutputConfidence[tid.xy] = confidenceTotal / max(totalWeight, 1e-6);
+}
+)";
+
+constexpr char RESIDUAL_PREPARE_HLSL[] = R"(
+Texture2D<float4> ReducedColor : register(t0);
+Texture2D<float4> ReducedDenoised : register(t1);
+RWTexture2D<float4> Residual : register(u0);
+
+cbuffer ResampleParams : register(b0) {
+    uint2 SourceExtent;
+    uint2 TargetExtent;
+    float2 MotionScale;
+    float2 Padding;
+};
+
+[numthreads(8, 8, 1)]
+void PrepareResidual(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= TargetExtent)) return;
+    float3 original = ReducedColor.Load(int3(tid.xy, 0)).rgb;
+    float3 denoised = ReducedDenoised.Load(int3(tid.xy, 0)).rgb;
+    Residual[tid.xy] = float4(denoised - original, 0.0);
+}
+)";
+
+constexpr char RESIDUAL_HORIZONTAL_HLSL[] = R"(
+Texture2D<float4> Residual : register(t0);
+RWTexture2D<float4> HorizontalResidual : register(u0);
+
+cbuffer ResampleParams : register(b0) {
+    uint2 SourceExtent;
+    uint2 TargetExtent;
+    float2 MotionScale;
+    float2 Padding;
+};
+
+float CatmullRom(float x) {
+    x = abs(x);
+    if (x < 1.0) return ((1.5 * x - 2.5) * x) * x + 1.0;
+    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+    return 0.0;
+}
+
+[numthreads(8, 8, 1)]
+void UpsampleResidualHorizontal(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= SourceExtent.x || tid.y >= TargetExtent.y) return;
+    float reducedPosition = (float(tid.x) + 0.5) *
+        float(TargetExtent.x) / float(SourceExtent.x) - 0.5;
+    int center = int(floor(reducedPosition));
+    float3 result = 0.0;
+    float totalWeight = 0.0;
+    [unroll]
+    for (int x = -1; x <= 2; ++x) {
+        float weight = CatmullRom(reducedPosition - float(center + x));
+        int sampleX = clamp(center + x, 0, int(TargetExtent.x) - 1);
+        result += Residual.Load(int3(sampleX, tid.y, 0)).rgb * weight;
+        totalWeight += weight;
+    }
+    HorizontalResidual[tid.xy] = float4(
+        result / (abs(totalWeight) > 1e-6 ? totalWeight : 1.0), 0.0);
+}
+)";
+
+constexpr char RESIDUAL_VERTICAL_COMPOSITE_HLSL[] = R"(
+Texture2D<float4> OriginalColor : register(t0);
+Texture2D<float4> HorizontalResidual : register(t1);
+RWTexture2D<float4> OutputColor : register(u0);
+
+cbuffer ResampleParams : register(b0) {
+    uint2 SourceExtent;
+    uint2 TargetExtent;
+    float2 MotionScale;
+    float2 Padding;
+};
+
+float CatmullRom(float x) {
+    x = abs(x);
+    if (x < 1.0) return ((1.5 * x - 2.5) * x) * x + 1.0;
+    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+    return 0.0;
+}
+
+[numthreads(8, 8, 1)]
+void CompositeResidualVertical(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= SourceExtent)) return;
+    float4 original = OriginalColor.Load(int3(tid.xy, 0));
+    float reducedPosition = (float(tid.y) + 0.5) *
+        float(TargetExtent.y) / float(SourceExtent.y) - 0.5;
+    int center = int(floor(reducedPosition));
+    float3 residual = 0.0;
+    float totalWeight = 0.0;
+    [unroll]
+    for (int y = -1; y <= 2; ++y) {
+        float weight = CatmullRom(reducedPosition - float(center + y));
+        int sampleY = clamp(center + y, 0, int(TargetExtent.y) - 1);
+        residual += HorizontalResidual.Load(int3(tid.x, sampleY, 0)).rgb * weight;
+        totalWeight += weight;
+    }
+    residual /= abs(totalWeight) > 1e-6 ? totalWeight : 1.0;
+    OutputColor[tid.xy] = float4(saturate(original.rgb + residual), original.a);
+}
+)";
+
+struct ResampleConstants {
+	uint32_t sourceWidth = 0;
+	uint32_t sourceHeight = 0;
+	uint32_t targetWidth = 0;
+	uint32_t targetHeight = 0;
+	float motionScaleX = 1.0f;
+	float motionScaleY = 1.0f;
+	float padding0 = 0.0f;
+	float padding1 = 0.0f;
+};
+static_assert(sizeof(ResampleConstants) == 32);
+
 bool NGXSucceeded(NVSDK_NGX_Result result) noexcept {
 	return NVSDK_NGX_SUCCEED(result);
 }
@@ -454,8 +679,38 @@ struct DLSSNRFilter::Impl {
 	winrt::com_ptr<ID3D11Texture2D> sharedInput11;
 	winrt::com_ptr<ID3D11Texture2D> sharedOutput11;
 	winrt::com_ptr<ID3D11ShaderResourceView> inputSrv11;
+	ID3D11Texture2D* inputTexture11 = nullptr;
+	winrt::com_ptr<ID3D11ShaderResourceView> sharedInputSrv11;
+	winrt::com_ptr<ID3D11ShaderResourceView> sharedOutputSrv11;
 	winrt::com_ptr<ID3D11UnorderedAccessView> sharedInputUav11;
 	winrt::com_ptr<ID3D11ComputeShader> colorConvertShader11;
+	winrt::com_ptr<ID3D11ComputeShader> colorDownsampleVerticalShader11;
+	winrt::com_ptr<ID3D11ComputeShader> colorDownsampleHorizontalShader11;
+	winrt::com_ptr<ID3D11ComputeShader> guidanceDownsampleShader11;
+	winrt::com_ptr<ID3D11ComputeShader> residualPrepareShader11;
+	winrt::com_ptr<ID3D11ComputeShader> residualHorizontalShader11;
+	winrt::com_ptr<ID3D11ComputeShader> residualVerticalCompositeShader11;
+	winrt::com_ptr<ID3D11Buffer> resampleConstants11;
+	winrt::com_ptr<ID3D11Texture2D> reducedMotion11;
+	winrt::com_ptr<ID3D11Texture2D> reducedDepth11;
+	winrt::com_ptr<ID3D11Texture2D> reducedConfidence11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> reducedMotionUav11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> reducedDepthUav11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> reducedConfidenceUav11;
+	winrt::com_ptr<ID3D11ShaderResourceView> guidanceMotionSrv11;
+	winrt::com_ptr<ID3D11ShaderResourceView> guidanceDepthSrv11;
+	winrt::com_ptr<ID3D11ShaderResourceView> guidanceConfidenceSrv11;
+	ID3D11Texture2D* guidanceMotion11 = nullptr;
+	ID3D11Texture2D* guidanceDepth11 = nullptr;
+	ID3D11Texture2D* guidanceConfidence11 = nullptr;
+	winrt::com_ptr<ID3D11Texture2D> resampleIntermediate11;
+	winrt::com_ptr<ID3D11ShaderResourceView> resampleIntermediateSrv11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> resampleIntermediateUav11;
+	winrt::com_ptr<ID3D11Texture2D> residual11;
+	winrt::com_ptr<ID3D11ShaderResourceView> residualSrv11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> residualUav11;
+	winrt::com_ptr<ID3D11Texture2D> compositeOutput11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> compositeOutputUav11;
 	winrt::com_ptr<ID3D12Resource> sharedInput12;
 	winrt::com_ptr<ID3D12Resource> sharedOutput12;
 	std::unique_ptr<FrameGuidanceD3D12Interop> guidanceInterop;
@@ -486,9 +741,12 @@ struct DLSSNRFilter::Impl {
 	TimingWindow evaluateGpuTimings;
 	FrameGuidanceFrameId lastGuidanceResetFrameId =
 		std::numeric_limits<FrameGuidanceFrameId>::max();
+	uint32_t sourceWidth = 0;
+	uint32_t sourceHeight = 0;
 	uint32_t width = 0;
 	uint32_t height = 0;
 	bool convertInputToRgba = false;
+	bool useResolutionScaling = false;
 	bool coreInitialized = false;
 	bool snippetInitialized = false;
 	bool snippetCallerHookInstalled = false;
@@ -997,6 +1255,17 @@ static bool CreateSharedTexture(
 	return true;
 }
 
+static bool UpdateInputShaderResource(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* input
+) noexcept;
+
+static bool CreateResolutionScalingResources(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* input,
+	const D3D11_TEXTURE2D_DESC& outputDesc
+) noexcept;
+
 static bool UpdateGuidanceResources(
 	DLSSNRFilter::Impl& impl,
 	const FrameGuidanceView& view,
@@ -1179,6 +1448,47 @@ static bool PrepareInput(
 	DLSSNRFilter::Impl& impl,
 	ID3D11Texture2D* input
 ) noexcept {
+	if (impl.useResolutionScaling) {
+		if (!UpdateInputShaderResource(impl, input)) return false;
+		const ResampleConstants constants{
+			.sourceWidth = impl.sourceWidth,
+			.sourceHeight = impl.sourceHeight,
+			.targetWidth = impl.width,
+			.targetHeight = impl.height,
+			.motionScaleX = float(impl.width) / float(impl.sourceWidth),
+			.motionScaleY = float(impl.height) / float(impl.sourceHeight)
+		};
+		impl.context11->UpdateSubresource(
+			impl.resampleConstants11.get(), 0, nullptr, &constants, 0, 0);
+		ID3D11ShaderResourceView* srv = impl.inputSrv11.get();
+		ID3D11UnorderedAccessView* uav = impl.resampleIntermediateUav11.get();
+		ID3D11Buffer* constantBuffer = impl.resampleConstants11.get();
+		impl.context11->CSSetShader(
+			impl.colorDownsampleVerticalShader11.get(), nullptr, 0);
+		impl.context11->CSSetShaderResources(0, 1, &srv);
+		impl.context11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		impl.context11->CSSetConstantBuffers(0, 1, &constantBuffer);
+		impl.context11->Dispatch(
+			(impl.sourceWidth + 7) / 8, (impl.height + 7) / 8, 1);
+		ID3D11ShaderResourceView* nullSrv = nullptr;
+		ID3D11UnorderedAccessView* nullUav = nullptr;
+		ID3D11Buffer* nullBuffer = nullptr;
+		impl.context11->CSSetShaderResources(0, 1, &nullSrv);
+		impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+		srv = impl.resampleIntermediateSrv11.get();
+		uav = impl.sharedInputUav11.get();
+		impl.context11->CSSetShader(
+			impl.colorDownsampleHorizontalShader11.get(), nullptr, 0);
+		impl.context11->CSSetShaderResources(0, 1, &srv);
+		impl.context11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		impl.context11->Dispatch(
+			(impl.width + 7) / 8, (impl.height + 7) / 8, 1);
+		impl.context11->CSSetShaderResources(0, 1, &nullSrv);
+		impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+		impl.context11->CSSetConstantBuffers(0, 1, &nullBuffer);
+		impl.context11->CSSetShader(nullptr, nullptr, 0);
+		return true;
+	}
 	D3D11_TEXTURE2D_DESC inputDesc{};
 	input->GetDesc(&inputDesc);
 	// The renderer's captured frame can be BGRA, while every DLSSNR output is
@@ -1206,6 +1516,215 @@ static bool PrepareInput(
 	impl.context11->CSSetShaderResources(0, 1, &nullSrv);
 	impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
 	impl.context11->CSSetShader(nullptr, nullptr, 0);
+	return true;
+}
+
+static bool UpdateGuidanceShaderResources(
+	DLSSNRFilter::Impl& impl,
+	const FrameGuidanceView& guidance
+) noexcept {
+	if (impl.guidanceMotion11 == guidance.motion.texture &&
+		impl.guidanceDepth11 == guidance.depth.texture &&
+		impl.guidanceConfidence11 == guidance.confidence.texture &&
+		impl.guidanceMotionSrv11 && impl.guidanceDepthSrv11 &&
+		impl.guidanceConfidenceSrv11) {
+		return true;
+	}
+	winrt::com_ptr<ID3D11ShaderResourceView> motionSrv;
+	winrt::com_ptr<ID3D11ShaderResourceView> depthSrv;
+	winrt::com_ptr<ID3D11ShaderResourceView> confidenceSrv;
+	HRESULT hr = impl.device11->CreateShaderResourceView(
+		guidance.motion.texture, nullptr, motionSrv.put());
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateShaderResourceView(
+			guidance.depth.texture, nullptr, depthSrv.put());
+	}
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateShaderResourceView(
+			guidance.confidence.texture, nullptr, confidenceSrv.put());
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR Frame Guidance downsample SRVs failed", hr);
+		return false;
+	}
+	impl.guidanceMotionSrv11 = std::move(motionSrv);
+	impl.guidanceDepthSrv11 = std::move(depthSrv);
+	impl.guidanceConfidenceSrv11 = std::move(confidenceSrv);
+	impl.guidanceMotion11 = guidance.motion.texture;
+	impl.guidanceDepth11 = guidance.depth.texture;
+	impl.guidanceConfidence11 = guidance.confidence.texture;
+	return true;
+}
+
+static bool PrepareReducedGuidance(
+	DLSSNRFilter::Impl& impl,
+	const FrameGuidanceView& guidance
+) noexcept {
+	if (!UpdateGuidanceShaderResources(impl, guidance)) return false;
+	const ResampleConstants constants{
+		.sourceWidth = impl.sourceWidth,
+		.sourceHeight = impl.sourceHeight,
+		.targetWidth = impl.width,
+		.targetHeight = impl.height,
+		.motionScaleX = float(impl.width) / float(impl.sourceWidth),
+		.motionScaleY = float(impl.height) / float(impl.sourceHeight)
+	};
+	impl.context11->UpdateSubresource(
+		impl.resampleConstants11.get(), 0, nullptr, &constants, 0, 0);
+	ID3D11ShaderResourceView* srvs[]{
+		impl.guidanceMotionSrv11.get(),
+		impl.guidanceDepthSrv11.get(),
+		impl.guidanceConfidenceSrv11.get()
+	};
+	ID3D11UnorderedAccessView* uavs[]{
+		impl.reducedMotionUav11.get(),
+		impl.reducedDepthUav11.get(),
+		impl.reducedConfidenceUav11.get()
+	};
+	ID3D11Buffer* constantBuffer = impl.resampleConstants11.get();
+	impl.context11->CSSetShader(
+		impl.guidanceDownsampleShader11.get(), nullptr, 0);
+	impl.context11->CSSetShaderResources(0, ARRAYSIZE(srvs), srvs);
+	impl.context11->CSSetUnorderedAccessViews(
+		0, ARRAYSIZE(uavs), uavs, nullptr);
+	impl.context11->CSSetConstantBuffers(0, 1, &constantBuffer);
+	impl.context11->Dispatch(
+		(impl.width + 7) / 8, (impl.height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[ARRAYSIZE(srvs)]{};
+	ID3D11UnorderedAccessView* nullUavs[ARRAYSIZE(uavs)]{};
+	ID3D11Buffer* nullBuffer = nullptr;
+	impl.context11->CSSetShaderResources(
+		0, ARRAYSIZE(nullSrvs), nullSrvs);
+	impl.context11->CSSetUnorderedAccessViews(
+		0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
+	impl.context11->CSSetConstantBuffers(0, 1, &nullBuffer);
+	impl.context11->CSSetShader(nullptr, nullptr, 0);
+	return true;
+}
+
+static FrameGuidanceRegion ScaleGuidanceRegion(
+	FrameGuidanceRegion region,
+	FrameGuidanceExtent source,
+	FrameGuidanceExtent target
+) noexcept {
+	const uint64_t sourceRight = uint64_t(region.x) + region.width;
+	const uint64_t sourceBottom = uint64_t(region.y) + region.height;
+	const uint32_t left = static_cast<uint32_t>(
+		uint64_t(region.x) * target.width / source.width);
+	const uint32_t top = static_cast<uint32_t>(
+		uint64_t(region.y) * target.height / source.height);
+	const uint32_t right = static_cast<uint32_t>(std::min<uint64_t>(
+		target.width,
+		(sourceRight * target.width + source.width - 1) / source.width));
+	const uint32_t bottom = static_cast<uint32_t>(std::min<uint64_t>(
+		target.height,
+		(sourceBottom * target.height + source.height - 1) / source.height));
+	return { left, top, right - left, bottom - top };
+}
+
+static FrameGuidanceView MakeReducedGuidance(
+	DLSSNRFilter::Impl& impl,
+	const FrameGuidanceView& source
+) noexcept {
+	const FrameGuidanceExtent sourceExtent{
+		impl.sourceWidth, impl.sourceHeight };
+	const FrameGuidanceExtent targetExtent{ impl.width, impl.height };
+	auto reducedMetadata = [&](const FrameGuidanceMetadata& metadata) {
+		FrameGuidanceMetadata result = metadata;
+		result.sourceExtent = targetExtent;
+		result.validRegion = ScaleGuidanceRegion(
+			metadata.validRegion, sourceExtent, targetExtent);
+		result.sync = {};
+		return result;
+	};
+	FrameGuidanceView result = source;
+	result.motion = {
+		.texture = impl.reducedMotion11.get(),
+		.format = DXGI_FORMAT_R16G16_FLOAT,
+		.metadata = reducedMetadata(source.motion.metadata)
+	};
+	result.depth = {
+		.texture = impl.reducedDepth11.get(),
+		.format = DXGI_FORMAT_R32_FLOAT,
+		.metadata = reducedMetadata(source.depth.metadata)
+	};
+	result.confidence = {
+		.texture = impl.reducedConfidence11.get(),
+		.format = DXGI_FORMAT_R8_UNORM,
+		.metadata = reducedMetadata(source.confidence.metadata)
+	};
+	result.rawDepth = {};
+	result.depthResidual = {};
+	return result;
+}
+
+static bool CompositeResidual(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* output,
+	ID3D11ShaderResourceView* reducedDenoised
+) noexcept {
+	const ResampleConstants constants{
+		.sourceWidth = impl.sourceWidth,
+		.sourceHeight = impl.sourceHeight,
+		.targetWidth = impl.width,
+		.targetHeight = impl.height,
+		.motionScaleX = float(impl.width) / float(impl.sourceWidth),
+		.motionScaleY = float(impl.height) / float(impl.sourceHeight)
+	};
+	impl.context11->UpdateSubresource(
+		impl.resampleConstants11.get(), 0, nullptr, &constants, 0, 0);
+	ID3D11ShaderResourceView* prepareSrvs[]{
+		impl.sharedInputSrv11.get(), reducedDenoised
+	};
+	ID3D11UnorderedAccessView* prepareUav = impl.residualUav11.get();
+	ID3D11Buffer* constantBuffer = impl.resampleConstants11.get();
+	impl.context11->CSSetShader(
+		impl.residualPrepareShader11.get(), nullptr, 0);
+	impl.context11->CSSetShaderResources(
+		0, ARRAYSIZE(prepareSrvs), prepareSrvs);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &prepareUav, nullptr);
+	impl.context11->CSSetConstantBuffers(0, 1, &constantBuffer);
+	impl.context11->Dispatch(
+		(impl.width + 7) / 8, (impl.height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullPrepareSrvs[ARRAYSIZE(prepareSrvs)]{};
+	ID3D11UnorderedAccessView* nullUav = nullptr;
+	impl.context11->CSSetShaderResources(
+		0, ARRAYSIZE(nullPrepareSrvs), nullPrepareSrvs);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+
+	ID3D11ShaderResourceView* horizontalSrv = impl.residualSrv11.get();
+	ID3D11UnorderedAccessView* horizontalUav =
+		impl.resampleIntermediateUav11.get();
+	impl.context11->CSSetShader(
+		impl.residualHorizontalShader11.get(), nullptr, 0);
+	impl.context11->CSSetShaderResources(0, 1, &horizontalSrv);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &horizontalUav, nullptr);
+	impl.context11->Dispatch(
+		(impl.sourceWidth + 7) / 8, (impl.height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrv = nullptr;
+	impl.context11->CSSetShaderResources(0, 1, &nullSrv);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+
+	ID3D11ShaderResourceView* verticalSrvs[]{
+		impl.inputSrv11.get(), impl.resampleIntermediateSrv11.get()
+	};
+	ID3D11UnorderedAccessView* compositeUav = impl.compositeOutputUav11.get();
+	impl.context11->CSSetShader(
+		impl.residualVerticalCompositeShader11.get(), nullptr, 0);
+	impl.context11->CSSetShaderResources(
+		0, ARRAYSIZE(verticalSrvs), verticalSrvs);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &compositeUav, nullptr);
+	impl.context11->Dispatch(
+		(impl.sourceWidth + 7) / 8, (impl.sourceHeight + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullVerticalSrvs[ARRAYSIZE(verticalSrvs)]{};
+	ID3D11Buffer* nullBuffer = nullptr;
+	impl.context11->CSSetShaderResources(
+		0, ARRAYSIZE(nullVerticalSrvs), nullVerticalSrvs);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+	impl.context11->CSSetConstantBuffers(0, 1, &nullBuffer);
+	impl.context11->CSSetShader(nullptr, nullptr, 0);
+	impl.context11->CopyResource(output, impl.compositeOutput11.get());
 	return true;
 }
 
@@ -1254,6 +1773,8 @@ bool DLSSNRFilter::Initialize(
 		}
 	} initStatus;
 	_settings = settings;
+	_settings.processingResolutionPercent = std::clamp(
+		_settings.processingResolutionPercent, 50u, 100u);
 	_impl.reset();
 	FrameGuidancePerformance::ResetDlssnrGpuTiming();
 	auto impl = std::make_unique<Impl>();
@@ -1278,8 +1799,17 @@ bool DLSSNRFilter::Initialize(
 			(uint32_t)inputDesc.Format, (uint32_t)outputDesc.Format));
 		return false;
 	}
-	impl->width = inputDesc.Width;
-	impl->height = inputDesc.Height;
+	impl->sourceWidth = inputDesc.Width;
+	impl->sourceHeight = inputDesc.Height;
+	impl->useResolutionScaling = _settings.processingResolutionPercent < 100;
+	impl->width = impl->useResolutionScaling ? std::max(
+		1u, static_cast<uint32_t>(std::lround(
+			double(inputDesc.Width) *
+			double(_settings.processingResolutionPercent) / 100.0))) : inputDesc.Width;
+	impl->height = impl->useResolutionScaling ? std::max(
+		1u, static_cast<uint32_t>(std::lround(
+			double(inputDesc.Height) *
+			double(_settings.processingResolutionPercent) / 100.0))) : inputDesc.Height;
 	impl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
 
 	HRESULT hr = D3D12CreateDevice(
@@ -1308,13 +1838,19 @@ bool DLSSNRFilter::Initialize(
 
 	D3D11_TEXTURE2D_DESC sharedDesc = outputDesc;
 	sharedDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sharedDesc.Width = impl->width;
+	sharedDesc.Height = impl->height;
 	if (!CreateSharedTexture(*impl, sharedDesc, true,
 		impl->sharedInput11, impl->sharedInput12) ||
 		!CreateSharedTexture(*impl, sharedDesc, true,
 			impl->sharedOutput11, impl->sharedOutput12)) {
 		return false;
 	}
-	if (impl->convertInputToRgba) {
+	if (impl->useResolutionScaling) {
+		if (!CreateResolutionScalingResources(*impl, input, outputDesc)) {
+			return false;
+		}
+	} else if (impl->convertInputToRgba) {
 		hr = impl->device11->CreateShaderResourceView(
 			input, nullptr, impl->inputSrv11.put());
 		if (SUCCEEDED(hr)) {
@@ -1541,10 +2077,12 @@ bool DLSSNRFilter::Initialize(
 
 	LogDlssnrStatus(fmt::format(
 		"DLSSNR STATUS: Feature=18 created=true path={} size={}x{} preset=default(1) "
-		"style={} intensity={} localTone={} localStructure={} guidanceMode={} autoMask={} "
+		"processingResolution={}% internalSize={}x{} style={} intensity={} localTone={} "
+		"localStructure={} guidanceMode={} autoMask={} "
 		"depthInterval={} passes={} historyMode={} disabled=false",
 		ENABLE_CORE_FEATURE18_DIAGNOSTIC ? "core-diagnostic" : "signed-snippet",
-		impl->width, impl->height, _settings.style,
+		impl->sourceWidth, impl->sourceHeight,
+		_settings.processingResolutionPercent, impl->width, impl->height, _settings.style,
 		_settings.intensity, _settings.localToneStrength,
 		_settings.localStructureStrength, _settings.guidanceMode,
 		_settings.useAutoMask,
@@ -1633,14 +2171,29 @@ bool DLSSNRFilter::_DrawOnce(
 	const double inputPrepareMs = std::chrono::duration<double, std::milli>(
 		std::chrono::steady_clock::now() - inputPrepareStart).count();
 	if (impl.disabled) {
+		if (impl.useResolutionScaling) {
+			return CompositeResidual(
+				impl, output, impl.sharedInputSrv11.get());
+		}
 		impl.context11->CopyResource(output, impl.sharedInput11.get());
 		return true;
 	}
 	const auto guidancePrepareStart = std::chrono::steady_clock::now();
 	const FrameGuidanceView guidance = SelectGuidance(
-		context, _settings, { impl.width, impl.height });
-	if (!UpdateGuidanceResources(impl, guidance, context.frameId) ||
-		!impl.guidanceInterop->WaitForProducer(impl.context11, guidance)) {
+		context, _settings, { impl.sourceWidth, impl.sourceHeight });
+	if (!impl.guidanceInterop->WaitForProducer(impl.context11, guidance)) {
+		return fail("guidance-interop");
+	}
+	FrameGuidanceView reducedGuidance;
+	const FrameGuidanceView* evaluateGuidance = &guidance;
+	if (impl.useResolutionScaling) {
+		if (!PrepareReducedGuidance(impl, guidance)) {
+			return fail("guidance-downsample");
+		}
+		reducedGuidance = MakeReducedGuidance(impl, guidance);
+		evaluateGuidance = &reducedGuidance;
+	}
+	if (!UpdateGuidanceResources(impl, *evaluateGuidance, context.frameId)) {
 		return fail("guidance-interop");
 	}
 	const double guidancePrepareMs = std::chrono::duration<double, std::milli>(
@@ -1682,11 +2235,11 @@ bool DLSSNRFilter::_DrawOnce(
 		commandList, D3D12_RESOURCE_STATE_COMMON,
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	const bool guidanceReset = forceHistoryReset ||
-		(guidance.requiresHistoryReset &&
+		(evaluateGuidance->requiresHistoryReset &&
 			impl.lastGuidanceResetFrameId != context.frameId);
 	DWORD sehCode = 0;
 	if (!SetEvaluateParametersSafely(
-		impl, _settings, guidance, guidanceReset, &sehCode)) {
+		impl, _settings, *evaluateGuidance, guidanceReset, &sehCode)) {
 		commandList->Close();
 		Logger::Get().Error(fmt::format(
 			"DLSSNR evaluation parameter setup raised SEH {:#x}", sehCode));
@@ -1770,8 +2323,16 @@ bool DLSSNRFilter::_DrawOnce(
 	if (FAILED(hr)) {
 		return fail("output-signal-wait");
 	}
-	impl.context11->CopyResource(
-		output, impl.disabled ? impl.sharedInput11.get() : impl.sharedOutput11.get());
+	if (impl.useResolutionScaling) {
+		if (!CompositeResidual(
+			impl, output, impl.disabled ? impl.sharedInputSrv11.get() :
+				impl.sharedOutputSrv11.get())) {
+			return fail("residual-composite");
+		}
+	} else {
+		impl.context11->CopyResource(
+			output, impl.disabled ? impl.sharedInput11.get() : impl.sharedOutput11.get());
+	}
 	const double submitMs = std::chrono::duration<double, std::milli>(
 		std::chrono::steady_clock::now() - submitStart).count();
 	impl.slotWaitTimings.Add(slotWaitMs);
@@ -1804,6 +2365,192 @@ bool DLSSNRFilter::_DrawOnce(
 		}
 	}
 	return true;
+}
+
+static bool CreateComputeShader(
+	DLSSNRFilter::Impl& impl,
+	std::string_view source,
+	const char* entryPoint,
+	const char* sourceName,
+	winrt::com_ptr<ID3D11ComputeShader>& shader
+) noexcept {
+	winrt::com_ptr<ID3DBlob> shaderBlob;
+	if (!DirectXHelper::CompileComputeShader(
+		source, entryPoint, shaderBlob.put(), sourceName)) {
+		return false;
+	}
+	const HRESULT hr = impl.device11->CreateComputeShader(
+		shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), nullptr,
+		shader.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError(fmt::format(
+			"Create {} compute shader failed", sourceName), hr);
+		return false;
+	}
+	return true;
+}
+
+static bool UpdateInputShaderResource(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* input
+) noexcept {
+	if (impl.inputTexture11 == input && impl.inputSrv11) return true;
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	const HRESULT hr = impl.device11->CreateShaderResourceView(
+		input, nullptr, srv.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR processing-resolution input SRV failed", hr);
+		return false;
+	}
+	impl.inputSrv11 = std::move(srv);
+	impl.inputTexture11 = input;
+	return true;
+}
+
+static bool CreateResolutionScalingResources(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* input,
+	const D3D11_TEXTURE2D_DESC& outputDesc
+) noexcept {
+	if (!UpdateInputShaderResource(impl, input)) return false;
+	HRESULT hr = impl.device11->CreateShaderResourceView(
+		impl.sharedInput11.get(), nullptr, impl.sharedInputSrv11.put());
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateShaderResourceView(
+			impl.sharedOutput11.get(), nullptr, impl.sharedOutputSrv11.put());
+	}
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateUnorderedAccessView(
+			impl.sharedInput11.get(), nullptr, impl.sharedInputUav11.put());
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR processing-resolution color views failed", hr);
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC compositeDesc = outputDesc;
+	compositeDesc.Usage = D3D11_USAGE_DEFAULT;
+	compositeDesc.CPUAccessFlags = 0;
+	compositeDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE |
+		D3D11_BIND_UNORDERED_ACCESS;
+	compositeDesc.MiscFlags = 0;
+	hr = impl.device11->CreateTexture2D(
+		&compositeDesc, nullptr, impl.compositeOutput11.put());
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateUnorderedAccessView(
+			impl.compositeOutput11.get(), nullptr,
+			impl.compositeOutputUav11.put());
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR processing-resolution composite failed", hr);
+		return false;
+	}
+
+	impl.resampleIntermediate11 = DirectXHelper::CreateTexture2D(
+		impl.device11, DXGI_FORMAT_R16G16B16A16_FLOAT,
+		impl.sourceWidth, impl.height,
+		D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+	impl.residual11 = DirectXHelper::CreateTexture2D(
+		impl.device11, DXGI_FORMAT_R16G16B16A16_FLOAT,
+		impl.width, impl.height,
+		D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+	if (!impl.resampleIntermediate11 || !impl.residual11) {
+		Logger::Get().Error(
+			"Create DLSSNR processing-resolution residual textures failed");
+		return false;
+	}
+	hr = impl.device11->CreateShaderResourceView(
+		impl.resampleIntermediate11.get(), nullptr,
+		impl.resampleIntermediateSrv11.put());
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateUnorderedAccessView(
+			impl.resampleIntermediate11.get(), nullptr,
+			impl.resampleIntermediateUav11.put());
+	}
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateShaderResourceView(
+			impl.residual11.get(), nullptr, impl.residualSrv11.put());
+	}
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateUnorderedAccessView(
+			impl.residual11.get(), nullptr, impl.residualUav11.put());
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR processing-resolution residual views failed", hr);
+		return false;
+	}
+
+	constexpr UINT GUIDANCE_BIND_FLAGS =
+		D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	constexpr UINT GUIDANCE_MISC_FLAGS =
+		D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	impl.reducedMotion11 = DirectXHelper::CreateTexture2D(
+		impl.device11, DXGI_FORMAT_R16G16_FLOAT, impl.width, impl.height,
+		GUIDANCE_BIND_FLAGS, D3D11_USAGE_DEFAULT, GUIDANCE_MISC_FLAGS);
+	impl.reducedDepth11 = DirectXHelper::CreateTexture2D(
+		impl.device11, DXGI_FORMAT_R32_FLOAT, impl.width, impl.height,
+		GUIDANCE_BIND_FLAGS, D3D11_USAGE_DEFAULT, GUIDANCE_MISC_FLAGS);
+	impl.reducedConfidence11 = DirectXHelper::CreateTexture2D(
+		impl.device11, DXGI_FORMAT_R8_UNORM, impl.width, impl.height,
+		GUIDANCE_BIND_FLAGS, D3D11_USAGE_DEFAULT, GUIDANCE_MISC_FLAGS);
+	if (!impl.reducedMotion11 || !impl.reducedDepth11 ||
+		!impl.reducedConfidence11) {
+		Logger::Get().Error(
+			"Create DLSSNR reduced Frame Guidance textures failed");
+		return false;
+	}
+	hr = impl.device11->CreateUnorderedAccessView(
+		impl.reducedMotion11.get(), nullptr, impl.reducedMotionUav11.put());
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateUnorderedAccessView(
+			impl.reducedDepth11.get(), nullptr, impl.reducedDepthUav11.put());
+	}
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateUnorderedAccessView(
+			impl.reducedConfidence11.get(), nullptr,
+			impl.reducedConfidenceUav11.put());
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR reduced Frame Guidance UAVs failed", hr);
+		return false;
+	}
+
+	D3D11_BUFFER_DESC constantsDesc{};
+	constantsDesc.ByteWidth = sizeof(ResampleConstants);
+	constantsDesc.Usage = D3D11_USAGE_DEFAULT;
+	constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	hr = impl.device11->CreateBuffer(
+		&constantsDesc, nullptr, impl.resampleConstants11.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR processing-resolution constants failed", hr);
+		return false;
+	}
+
+	return CreateComputeShader(
+			impl, COLOR_DOWNSAMPLE_HLSL, "DownsampleColorVertical",
+			"DLSSNRColorDownsampleVertical", impl.colorDownsampleVerticalShader11) &&
+		CreateComputeShader(
+			impl, COLOR_DOWNSAMPLE_HLSL, "DownsampleColorHorizontal",
+			"DLSSNRColorDownsampleHorizontal", impl.colorDownsampleHorizontalShader11) &&
+		CreateComputeShader(
+			impl, GUIDANCE_DOWNSAMPLE_HLSL, "DownsampleGuidance",
+			"DLSSNRGuidanceDownsample", impl.guidanceDownsampleShader11) &&
+		CreateComputeShader(
+			impl, RESIDUAL_PREPARE_HLSL, "PrepareResidual",
+			"DLSSNRResidualPrepare", impl.residualPrepareShader11) &&
+		CreateComputeShader(
+			impl, RESIDUAL_HORIZONTAL_HLSL, "UpsampleResidualHorizontal",
+			"DLSSNRResidualHorizontal", impl.residualHorizontalShader11) &&
+		CreateComputeShader(
+			impl, RESIDUAL_VERTICAL_COMPOSITE_HLSL,
+			"CompositeResidualVertical", "DLSSNRResidualVerticalComposite",
+			impl.residualVerticalCompositeShader11);
 }
 
 bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {

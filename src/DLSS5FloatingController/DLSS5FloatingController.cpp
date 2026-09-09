@@ -173,6 +173,8 @@ struct UpdateWorkerResult {
 struct FilterSettings {
 	// 0 experimental DLSSNR, 1 stable single-frame CAS.
 	int backend = 0;
+	// Internal DLSSNR extent. The overlay and final output keep their size.
+	int processingResolutionPercent = 100;
 	int style = 0;
 	int intensity = 100;
 	int localTone = 100;
@@ -350,6 +352,12 @@ RECT BackendRect(const ControllerData& data) {
 	return { Dip(data, 130), Dip(data, 579), client.right - Dip(data, 18), Dip(data, 611) };
 }
 
+RECT ProcessingResolutionRect(const ControllerData& data) {
+	RECT client{};
+	GetClientRect(data.hwnd, &client);
+	return { Dip(data, 150), Dip(data, 621), client.right - Dip(data, 18), Dip(data, 653) };
+}
+
 RECT SettingsTabRect(const ControllerData& data, int page) {
 	const int left = 18 + page * 72;
 	return { Dip(data, left), Dip(data, 80), Dip(data, left + 68), Dip(data, 106) };
@@ -478,6 +486,9 @@ void LoadSettings(ControllerData& data) {
 	const std::wstring path = SettingsPath();
 	data.settings.backend = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Backend", 0, path.c_str())), 0, 1);
+	data.settings.processingResolutionPercent = std::clamp(
+		static_cast<int>(GetPrivateProfileIntW(
+			L"Filter", L"ProcessingResolutionPercent", 100, path.c_str())), 50, 100);
 	data.settings.style = std::clamp(
 		static_cast<int>(GetPrivateProfileIntW(L"Filter", L"Style", 0, path.c_str())), 0, 2);
 	data.settings.intensity = std::clamp(
@@ -544,6 +555,8 @@ void SaveFilterSetting(const std::wstring& path, const wchar_t* key, int value) 
 void SaveSettings(const ControllerData& data) {
 	const std::wstring path = SettingsPath();
 	SaveFilterSetting(path, L"Backend", data.settings.backend);
+	SaveFilterSetting(path, L"ProcessingResolutionPercent",
+		data.settings.processingResolutionPercent);
 	SaveFilterSetting(path, L"Style", data.settings.style);
 	SaveFilterSetting(path, L"Intensity", data.settings.intensity);
 	SaveFilterSetting(path, L"LocalTone", data.settings.localTone);
@@ -1297,6 +1310,7 @@ std::wstring SettingsSummary(const ControllerData& data) {
 	}
 	return std::wstring(StyleName(data.settings.style)) + L" · 强度 " +
 		std::to_wstring(data.settings.intensity) + L"% · " +
+		L"处理 " + std::to_wstring(data.settings.processingResolutionPercent) + L"% · " +
 		std::to_wstring(data.settings.passes) + L" 次处理 · " +
 		HistoryModeName(data.settings.historyMode) + L" · " +
 		GuidanceModeName(data.settings.guidanceMode);
@@ -2022,6 +2036,36 @@ void PaintSettingsPanel(HDC dc, ControllerData& data) {
 			DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 	}
 
+	SetTextColor(dc, experimental ? PARCHMENT : PARCHMENT_DISABLED);
+	RECT resolutionLabel{ Dip(data, 19), Dip(data, 621), Dip(data, 144), Dip(data, 653) };
+	DrawTextW(dc, L"处理分辨率", -1, &resolutionLabel,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	RECT resolution = ProcessingResolutionRect(data);
+	FillPanel(dc, resolution, WOOD_PANEL_DARK);
+	constexpr int resolutionValues[] = { 100, 75, 67, 50 };
+	const int resolutionSegmentWidth = (resolution.right - resolution.left) / 4;
+	for (int index = 0; index < 4; ++index) {
+		RECT segment{ resolution.left + resolutionSegmentWidth * index, resolution.top,
+			index == 3 ? resolution.right :
+				resolution.left + resolutionSegmentWidth * (index + 1), resolution.bottom };
+		const bool selected = experimental &&
+			data.settings.processingResolutionPercent == resolutionValues[index];
+		if (selected) {
+			RECT selectedRect{ segment.left + Dip(data, 2), segment.top + Dip(data, 2),
+				segment.right - Dip(data, 2), segment.bottom - Dip(data, 2) };
+			FillPanel(dc, selectedRect, GOLD, GOLD_HOVER, GOLD_DARK);
+		}
+		SetTextColor(dc, !experimental ? PARCHMENT_DISABLED :
+			(selected ? WOOD_BORDER_DARK : PARCHMENT_MUTED));
+		const std::wstring text = std::to_wstring(resolutionValues[index]) + L"%";
+		DrawTextW(dc, text.c_str(), -1, &segment,
+			DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	}
+	SetTextColor(dc, experimental ? PARCHMENT_MUTED : PARCHMENT_DISABLED);
+	RECT resolutionHint{ Dip(data, 19), Dip(data, 655), client.right - Dip(data, 19), Dip(data, 679) };
+	DrawTextW(dc, L"只降低内部计算量；输出尺寸与窗口位置不变", -1, &resolutionHint,
+		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
 }
 
 void PaintController(ControllerData& data) {
@@ -2383,6 +2427,17 @@ bool HandleSettingsPress(ControllerData& data, POINT point) {
 		InvalidateRect(data.hwnd, nullptr, FALSE);
 		return true;
 	}
+	if (PointIn(ProcessingResolutionRect(data), point)) {
+		constexpr int values[] = { 100, 75, 67, 50 };
+		const RECT rect = ProcessingResolutionRect(data);
+		const int rectWidth = std::max(1, static_cast<int>(rect.right - rect.left));
+		const int index = std::clamp(
+			static_cast<int>(point.x - rect.left) * 4 / rectWidth, 0, 3);
+		data.settings.processingResolutionPercent = values[index];
+		SaveSettings(data);
+		InvalidateRect(data.hwnd, nullptr, FALSE);
+		return true;
+	}
 	return point.y >= Dip(data, 76) && point.y < ButtonRect(data).top;
 }
 
@@ -2444,6 +2499,8 @@ bool StartEngine(ControllerData& data, HWND target) {
 	std::wstring command = L"\"" + engine + L"\" --hwnd " +
 		std::to_wstring(reinterpret_cast<uintptr_t>(target)) + L" --stop-event \"" +
 		data.stopEventName + L"\" --backend " + std::to_wstring(data.settings.backend) +
+		L" --processing-resolution " +
+			std::to_wstring(data.settings.processingResolutionPercent) +
 		L" --style " + std::to_wstring(data.settings.style) +
 		L" --intensity " + std::to_wstring(data.settings.intensity / 100.0f) +
 		L" --local-tone " + std::to_wstring(data.settings.localTone / 100.0f) +

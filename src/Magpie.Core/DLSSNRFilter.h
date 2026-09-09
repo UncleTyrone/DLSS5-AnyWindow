@@ -32,6 +32,9 @@ struct DLSSNRTelemetry {
 };
 
 struct DLSSNRSettings {
+	// DLSSNR runs at this percentage of the captured frame. The generated
+	// residual is reconstructed over the original full-resolution image.
+	uint32_t processingResolutionPercent = 100;
 	int style = 0;
 	float intensity = 1.0f;
 	float localToneStrength = 1.0f;
