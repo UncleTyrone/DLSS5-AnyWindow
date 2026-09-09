@@ -33,14 +33,23 @@ constexpr wchar_t INSTANCE_MUTEX[] = L"Local\\DLSS5DoubleFloatingController.Sing
 constexpr wchar_t INSTANCE_MUTEX_QA[] = L"Local\\DLSS5DoubleFloatingController.PixelQaInstance";
 constexpr wchar_t ENGINE_NAME[] = L"DLSSNRWindowDouble.exe";
 constexpr wchar_t SETTINGS_FILE[] = L"DLSS5-settings.ini";
-constexpr wchar_t APP_VERSION[] = L"1.9.1";
+constexpr wchar_t APP_VERSION[] = L"1.9.2";
 constexpr int APP_VERSION_MAJOR = 1;
 constexpr int APP_VERSION_MINOR = 9;
-constexpr int APP_VERSION_PATCH = 1;
+constexpr int APP_VERSION_PATCH = 2;
 constexpr wchar_t GITHUB_REPOSITORY_URL[] =
 	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow";
 constexpr wchar_t GITHUB_RELEASES_API[] =
 	L"https://api.github.com/repos/Shangyuwang11/DLSS5-AnyWindow/releases?per_page=20";
+constexpr wchar_t COMPONENT_UPDATE_BASE_URL[] =
+	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow/releases/download/"
+	L"v1.9.2-dlss5-anywindow/";
+constexpr wchar_t RENDERER_UPDATE_ASSET[] = L"DLSSNRWindowDouble-1.9.2.exe";
+constexpr wchar_t EFFECT_UPDATE_ASSET[] = L"DLSSNR_AI_Filter-1.9.2.hlsl";
+constexpr wchar_t RENDERER_SHA256[] =
+	L"1c9de16142c177ec05e19edfb69a1292cb4a1797458656acba0027e8d0762674";
+constexpr wchar_t EFFECT_SHA256[] =
+	L"e425bcbbaa92eeacbb0b70cc78d5ba9a9e2b737f5986ea071eef394c618e4159";
 constexpr int TOGGLE_HOTKEY_ID = 0xD157;
 constexpr int VISIBILITY_HOTKEY_ID = 0xD158;
 constexpr UINT WM_UPDATE_WORKER_RESULT = WM_APP + 0x157;
@@ -246,6 +255,7 @@ struct ControllerData {
 	std::wstring updateAssetUrl;
 	std::wstring updateHashUrl;
 	std::wstring updateMessage;
+	bool automaticUpdateCheck = false;
 	FilterSettings settings;
 	UiSettings uiSettings;
 	HFONT titleFont = nullptr;
@@ -623,7 +633,7 @@ bool HttpGet(
 	if (resource.empty()) resource = L"/";
 
 	HINTERNET session = WinHttpOpen(
-		L"DLSS5-AnyWindow-Updater/1.9.1",
+		L"DLSS5-AnyWindow-Updater/1.9.2",
 		WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
 		WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!session) {
@@ -873,6 +883,155 @@ bool WriteBytes(const std::filesystem::path& path, const std::vector<uint8_t>& b
 	return stream.good();
 }
 
+std::wstring FileSha256Hex(const std::filesystem::path& path, size_t maximumBytes) {
+	std::ifstream stream(path, std::ios::binary | std::ios::ate);
+	if (!stream) return {};
+	const std::streamoff length = stream.tellg();
+	if (length < 0 || static_cast<uint64_t>(length) > maximumBytes) return {};
+	stream.seekg(0, std::ios::beg);
+	std::vector<uint8_t> bytes(static_cast<size_t>(length));
+	if (!bytes.empty()) {
+		stream.read(reinterpret_cast<char*>(bytes.data()),
+			static_cast<std::streamsize>(bytes.size()));
+		if (!stream) return {};
+	}
+	return Sha256Hex(bytes);
+}
+
+std::wstring ComponentUpdateBaseUrl(bool qaInstance) {
+	if (qaInstance) {
+		std::wstring value(32768, L'\0');
+		const DWORD length = GetEnvironmentVariableW(
+			L"DLSS5_UPDATE_BASE_URL", value.data(), static_cast<DWORD>(value.size()));
+		if (length > 0 && length < value.size()) {
+			value.resize(length);
+			if (value.back() != L'/') value.push_back(L'/');
+			return value;
+		}
+		// Other controller UI tests intentionally carry no rendering payload.
+		// Only opt into component synchronization when the QA server is explicit.
+		return {};
+	}
+	return COMPONENT_UPDATE_BASE_URL;
+}
+
+struct CompanionUpdate {
+	std::filesystem::path target;
+	std::filesystem::path temporary;
+	std::filesystem::path backup;
+	std::wstring asset;
+	std::wstring expectedHash;
+	size_t maximumBytes = 0;
+	bool hadOriginal = false;
+	bool installed = false;
+};
+
+bool EnsureCompanionComponents(bool qaInstance, std::wstring& error) {
+	const std::filesystem::path directory(ExeDirectory());
+	std::array<CompanionUpdate, 2> components{
+		CompanionUpdate{
+			.target = directory / ENGINE_NAME,
+			.asset = RENDERER_UPDATE_ASSET,
+			.expectedHash = RENDERER_SHA256,
+			.maximumBytes = 32 * 1024 * 1024 },
+		CompanionUpdate{
+			.target = directory / L"effects" / L"DLSSNR" / L"DLSSNR_AI_Filter.hlsl",
+			.asset = EFFECT_UPDATE_ASSET,
+			.expectedHash = EFFECT_SHA256,
+			.maximumBytes = 1024 * 1024 }
+	};
+
+	std::vector<CompanionUpdate*> pending;
+	for (CompanionUpdate& component : components) {
+		if (FileSha256Hex(component.target, component.maximumBytes) !=
+			component.expectedHash) pending.push_back(&component);
+	}
+	if (pending.empty()) return true;
+	auto cleanupTemporary = [&] {
+		for (CompanionUpdate* staged : pending) {
+			if (!staged->temporary.empty()) DeleteFileW(staged->temporary.c_str());
+		}
+	};
+
+	const std::wstring baseUrl = ComponentUpdateBaseUrl(qaInstance);
+	if (baseUrl.empty()) return true;
+	for (CompanionUpdate* component : pending) {
+		std::vector<uint8_t> bytes;
+		std::wstring httpError;
+		if (!HttpGet(baseUrl + component->asset, component->maximumBytes,
+			bytes, httpError)) {
+			error = L"下载渲染组件失败：" + httpError;
+			cleanupTemporary();
+			return false;
+		}
+		if (Sha256Hex(bytes) != component->expectedHash) {
+			error = L"渲染组件 SHA-256 校验失败，已拒绝安装";
+			cleanupTemporary();
+			return false;
+		}
+		std::error_code directoryError;
+		std::filesystem::create_directories(
+			component->target.parent_path(), directoryError);
+		if (directoryError) {
+			error = L"无法创建渲染组件目录";
+			cleanupTemporary();
+			return false;
+		}
+		component->temporary = component->target;
+		component->temporary += L".update-" + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+		component->backup = component->target;
+		component->backup += L".update-backup";
+		DeleteFileW(component->temporary.c_str());
+		if (!WriteBytes(component->temporary, bytes)) {
+			error = L"无法暂存渲染组件更新";
+			cleanupTemporary();
+			return false;
+		}
+	}
+
+	auto rollback = [&] {
+		for (auto iterator = pending.rbegin(); iterator != pending.rend(); ++iterator) {
+			CompanionUpdate& component = **iterator;
+			if (!component.installed) continue;
+			DeleteFileW(component.target.c_str());
+			if (component.hadOriginal) {
+				MoveFileExW(component.backup.c_str(), component.target.c_str(),
+					MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+			}
+			component.installed = false;
+		}
+	};
+
+	for (CompanionUpdate* component : pending) {
+		component->hadOriginal = FileExists(component->target);
+		DeleteFileW(component->backup.c_str());
+		if (component->hadOriginal && !MoveFileExW(
+			component->target.c_str(), component->backup.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+			error = L"渲染组件正在使用，无法更新（" +
+				std::to_wstring(GetLastError()) + L"）";
+			rollback();
+			cleanupTemporary();
+			return false;
+		}
+		if (!MoveFileExW(component->temporary.c_str(), component->target.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+			const DWORD moveError = GetLastError();
+			if (component->hadOriginal) {
+				MoveFileExW(component->backup.c_str(), component->target.c_str(),
+					MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+			}
+			error = L"安装渲染组件失败（" + std::to_wstring(moveError) + L"）";
+			rollback();
+			cleanupTemporary();
+			return false;
+		}
+		component->installed = true;
+	}
+	for (CompanionUpdate* component : pending) DeleteFileW(component->backup.c_str());
+	return true;
+}
+
 std::unique_ptr<UpdateWorkerResult> DownloadUpdateWorker(
 	std::wstring version, std::wstring assetUrl, std::wstring hashUrl,
 	std::wstring releaseUrl
@@ -882,7 +1041,7 @@ std::unique_ptr<UpdateWorkerResult> DownloadUpdateWorker(
 	result->version = std::move(version);
 	result->releaseUrl = std::move(releaseUrl);
 	if (assetUrl.empty() || hashUrl.empty()) {
-		result->message = L"这个版本没有可自动安装的控制器附件";
+		result->message = L"这个版本没有可自动安装的应用附件";
 		return result;
 	}
 	std::vector<uint8_t> expectedBody;
@@ -928,9 +1087,10 @@ void PostWorkerResult(HWND hwnd, std::unique_ptr<UpdateWorkerResult> result) {
 		reinterpret_cast<LPARAM>(raw))) delete raw;
 }
 
-void StartUpdateCheck(ControllerData& data) {
+void StartUpdateCheck(ControllerData& data, bool automatic = false) {
 	if (data.updateState == UpdateState::Checking ||
 		data.updateState == UpdateState::Downloading) return;
+	data.automaticUpdateCheck = automatic;
 	data.updateState = UpdateState::Checking;
 	data.updateMessage = L"正在连接 GitHub…";
 	InvalidateRect(data.hwnd, nullptr, FALSE);
@@ -948,7 +1108,7 @@ void StartUpdateDownload(ControllerData& data) {
 		return;
 	}
 	data.updateState = UpdateState::Downloading;
-	data.updateMessage = L"正在下载并校验控制器更新…";
+	data.updateMessage = L"正在下载并校验应用更新…";
 	InvalidateRect(data.hwnd, nullptr, FALSE);
 	const HWND hwnd = data.hwnd;
 	const std::wstring version = data.updateVersion;
@@ -1704,7 +1864,7 @@ void PaintAboutSettings(HDC dc, ControllerData& data) {
 	DrawTextW(dc, version.c_str(), -1, &versionRect,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-	DrawToggle(dc, data, L"启动时自动检查更新", 155,
+	DrawToggle(dc, data, L"启动时自动更新", 155,
 		data.uiSettings.autoCheckUpdates);
 
 	RECT statusCard{ Dip(data, 18), Dip(data, 202), client.right - Dip(data, 18), Dip(data, 246) };
@@ -1732,7 +1892,7 @@ void PaintAboutSettings(HDC dc, ControllerData& data) {
 	SelectObject(dc, data.statusFont);
 	SetTextColor(dc, PARCHMENT_MUTED);
 	RECT safeHint{ Dip(data, 19), Dip(data, 309), client.right - Dip(data, 19), Dip(data, 337) };
-	DrawTextW(dc, L"只更新悬浮控制器，保留滤镜运行库、模型和设置", -1, &safeHint,
+	DrawTextW(dc, L"自动更新应用组件，保留运行库、模型和设置", -1, &safeHint,
 		DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
 	RECT source = AboutSourceLinkRect(data);
@@ -2678,7 +2838,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 			data->targetTitle = L"一个或多个快捷键被占用，请在设置中更换";
 		}
 		SetTimer(hwnd, TIMER_POLL, 100, nullptr);
-		if (data->uiSettings.autoCheckUpdates) StartUpdateCheck(*data);
+		if (data->uiSettings.autoCheckUpdates) StartUpdateCheck(*data, true);
 		return 0;
 	case WM_UPDATE_WORKER_RESULT:
 	{
@@ -2709,6 +2869,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
 			data->updateAssetUrl = std::move(result->assetUrl);
 			data->updateHashUrl = std::move(result->hashUrl);
 			data->updateMessage.clear();
+			if (data->automaticUpdateCheck &&
+				!data->updateAssetUrl.empty() && !data->updateHashUrl.empty()) {
+				StartUpdateDownload(*data);
+			}
 		} else {
 			data->updateState = UpdateState::Current;
 			data->updateMessage = L"已是最新版";
@@ -2882,6 +3046,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
 		}
 		CloseHandle(instanceMutex);
 		return 0;
+	}
+	std::wstring componentUpdateError;
+	if (!EnsureCompanionComponents(qaInstance, componentUpdateError)) {
+		MessageBoxW(nullptr,
+			(L"控制器已启动，但渲染组件自动更新失败。\n\n" + componentUpdateError +
+				L"\n\n旧组件已保留；可稍后重新启动重试。").c_str(),
+			L"DLSS5 任意窗口自动更新", MB_OK | MB_ICONWARNING | MB_TOPMOST);
 	}
 
 	WNDCLASSEXW windowClass{};

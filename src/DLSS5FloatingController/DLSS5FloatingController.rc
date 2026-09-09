@@ -3,8 +3,8 @@
 101 ICON "..\\Magpie\\Magpie.ico"
 
 1 VERSIONINFO
- FILEVERSION 1,9,1,0
- PRODUCTVERSION 1,9,1,0
+ FILEVERSION 1,9,2,0
+ PRODUCTVERSION 1,9,2,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -17,11 +17,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Shangyuwang11"
             VALUE "FileDescription", "DLSS5 任意窗口滤镜控制器"
-            VALUE "FileVersion", "1.9.1"
+            VALUE "FileVersion", "1.9.2"
             VALUE "InternalName", "DLSS5FloatingController"
             VALUE "OriginalFilename", "DLSS5FloatingController.exe"
             VALUE "ProductName", "DLSS5 AnyWindow"
-            VALUE "ProductVersion", "1.9.1"
+            VALUE "ProductVersion", "1.9.2"
         END
     END
     BLOCK "VarFileInfo"
