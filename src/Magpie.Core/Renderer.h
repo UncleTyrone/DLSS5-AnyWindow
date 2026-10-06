@@ -1,5 +1,6 @@
 #pragma once
 #include "BackendDescriptorStore.h"
+#include <atomic>
 #include "CursorDrawer.h"
 #include "DeviceResources.h"
 #include "EffectDrawer.h"
@@ -45,7 +46,8 @@ public:
 	}
 
 	uint32_t FPS() const noexcept {
-		return _stepTimer.FPS();
+		const uint32_t presentedFps = _overlayFps.load(std::memory_order_relaxed);
+		return presentedFps ? presentedFps : _stepTimer.FPS();
 	}
 
 	void OnCursorVisibilityChanged(bool isVisible, bool onDestory);
@@ -169,9 +171,14 @@ private:
 	std::atomic<bool> _synchronousFramePresentationEnabled = false;
 	float _frameRateFilterTarget = 0.0f;
 	std::chrono::nanoseconds _synchronousPresentInterval{};
+	std::chrono::nanoseconds _dlssFgPaceSlot{};
+	std::chrono::steady_clock::time_point _dlssFgPaceAnchor{};
+	uint32_t _dlssFgPresentsRemaining = 0;
+	uint32_t _dlssFgPaceIndex = 0;
 	std::chrono::steady_clock::time_point _dlssFgDiagnosticsStart{};
 	uint32_t _dlssFgCapturedFrameCount = 0;
 	uint32_t _dlssFgPresentedFrameCount = 0;
+	std::atomic<uint32_t> _overlayFps{ 0 };
 	bool _isXeSSFrameGenerationActive = false;
 	bool _xessFgFrontendSuppressionLogged = false;
 

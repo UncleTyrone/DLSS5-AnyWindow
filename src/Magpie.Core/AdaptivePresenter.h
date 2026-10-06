@@ -44,6 +44,12 @@ private:
 	bool _isResized = false;
 	bool _isframeLatencyWaited = false;
 	bool _isSwitchingToSwapChain = false;
+	// Match XeSSFGPresenter: DLSSFG presents at a generated-frame cadence, so
+	// DXGI_PRESENT_ALLOW_TEARING is required to avoid DWM vsync coalescing.
+	bool _useTearingPresent = false;
+	UINT _lastDxgiPresentCount = 0;
+	UINT _lastDxgiRefreshCount = 0;
+	bool _haveDxgiStats = false;
 };
 
 }

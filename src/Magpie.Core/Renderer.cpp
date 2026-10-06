@@ -32,6 +32,7 @@
 #endif
 #include <dispatcherqueue.h>
 #include <d3dkmthk.h>
+#include <thread>
 
 namespace Magpie {
 
@@ -351,7 +352,7 @@ void Renderer::_FrontendRender(bool waitForGpu) noexcept {
 	}
 
 	// 绘制叠加层。ImGui 至少渲染两遍，否则经常有布局错误
-	_overlayDrawer.Draw(2, _stepTimer.FPS(), _effectsProfiler.GetTimings(), drawOffset);
+	_overlayDrawer.Draw(2, FPS(), _effectsProfiler.GetTimings(), drawOffset);
 
 	// 绘制光标
 	_cursorDrawer.Draw(frameTex.get(), drawOffset);
@@ -381,7 +382,7 @@ bool Renderer::Render(bool force, bool waitForGpu) noexcept {
 			return false;
 		}
 
-		if (!_cursorDrawer.NeedRedraw() && !_overlayDrawer.NeedRedraw(_stepTimer.FPS())) {
+		if (!_cursorDrawer.NeedRedraw() && !_overlayDrawer.NeedRedraw(FPS())) {
 			return false;
 		}
 	}
@@ -921,6 +922,14 @@ bool Renderer::_InitializeDLSSFrameGenerator(
 			(int64_t)std::llround(1'000'000'000.0 / outputFrameRate));
 	} else {
 		_synchronousPresentInterval = {};
+		const uint32_t multiplier = std::max(frameGenerator->Multiplier(), 1u);
+		_dlssFgPaceSlot = std::chrono::nanoseconds(
+			(int64_t)std::llround(1'000'000'000.0 / (60.0 * double(multiplier))));
+		Logger::Get().Info(fmt::format(
+			"DLSSFG present pacing enabled: default slot={:.2f} ms, multiplier={}x",
+			_dlssFgPaceSlot.count() / 1'000'000.0,
+			multiplier
+		));
 	}
 	_dlssFrameGenerator = std::move(frameGenerator);
 	return true;
@@ -956,6 +965,8 @@ void Renderer::_HandleDLSSFrameGenerationFailure(ID3D11Texture2D* input) noexcep
 void Renderer::_DisableDLSSFrameGenerationForSession() noexcept {
 	_dlssFrameGenerator.reset();
 	_synchronousPresentInterval = {};
+	_dlssFgPresentsRemaining = 0;
+	_overlayFps.store(0, std::memory_order_relaxed);
 	Logger::Get().Error(
 		"DLSS Frame Generation was disabled for this scaling session after repeated failures");
 }
@@ -1295,6 +1306,17 @@ void Renderer::_BackendRender(
 			_frameGuidanceService.IsInitialized()) {
 			_frameGuidanceService.ResetHistory(FrameGuidanceResetReason::LongPause);
 		}
+		if (_dlssFrameGenerator &&
+			_lastCapturedFrameTime != std::chrono::steady_clock::time_point{} &&
+			_synchronousPresentInterval.count() == 0) {
+			const auto captureDelta = captureTime - _lastCapturedFrameTime;
+			if (captureDelta > std::chrono::milliseconds(4) &&
+				captureDelta < std::chrono::milliseconds(250)) {
+				const uint32_t multiplier = std::max(_dlssFrameGenerator->Multiplier(), 1u);
+				_dlssFgPaceSlot = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					captureDelta / multiplier);
+			}
+		}
 		_lastCapturedFrameTime = captureTime;
 		++_capturedFrameId;
 		const FrameGuidanceRequirements guidanceRequirements =
@@ -1307,6 +1329,8 @@ void Renderer::_BackendRender(
 	}
 	if (_dlssFrameGenerator) {
 		++_dlssFgCapturedFrameCount;
+		_dlssFgPresentsRemaining = std::max(_dlssFrameGenerator->Multiplier(), 1u);
+		_dlssFgPaceIndex = 0;
 	}
 
 	ID3D11DeviceContext4* d3dDC = _backendResources.GetD3DDC();
@@ -1419,10 +1443,22 @@ bool Renderer::_PublishBackendTexture(
 		)) {
 			return false;
 		}
-		do {
-			Win32Helper::WaitForDwmComposition();
-		} while (_synchronousPresentInterval.count() > 0 &&
-			std::chrono::steady_clock::now() - presentStart < _synchronousPresentInterval);
+		++_dlssFgPaceIndex;
+		const bool morePresentsThisCapture = _dlssFgPresentsRemaining > 1;
+		if (_dlssFgPresentsRemaining > 0) {
+			--_dlssFgPresentsRemaining;
+		}
+
+		if (_synchronousPresentInterval.count() > 0) {
+			do {
+				Win32Helper::WaitForDwmComposition();
+			} while (std::chrono::steady_clock::now() - presentStart < _synchronousPresentInterval);
+		} else if (morePresentsThisCapture && _dlssFgPaceSlot.count() > 0) {
+			if (_dlssFgPaceIndex == 1) {
+				_dlssFgPaceAnchor = presentStart;
+			}
+			std::this_thread::sleep_until(_dlssFgPaceAnchor + _dlssFgPaceIndex * _dlssFgPaceSlot);
+		}
 
 		++_dlssFgPresentedFrameCount;
 		const auto now = std::chrono::steady_clock::now();
@@ -1432,10 +1468,15 @@ bool Renderer::_PublishBackendTexture(
 			const double elapsed = std::chrono::duration<double>(
 				now - _dlssFgDiagnosticsStart).count();
 			if (elapsed >= 1.0) {
+				const double submittedFps = _dlssFgPresentedFrameCount / elapsed;
+				_overlayFps.store(
+					uint32_t(std::lround(submittedFps)),
+					std::memory_order_relaxed);
 				Logger::Get().Info(fmt::format(
-					"DLSSFG presentation: captured={:.1f} FPS, submitted={:.1f} FPS",
+					"DLSSFG presentation: captured={:.1f} FPS, submitted={:.1f} FPS, paceSlot={:.2f} ms",
 					_dlssFgCapturedFrameCount / elapsed,
-					_dlssFgPresentedFrameCount / elapsed));
+					submittedFps,
+					_dlssFgPaceSlot.count() / 1'000'000.0));
 				_dlssFgDiagnosticsStart = now;
 				_dlssFgCapturedFrameCount = 0;
 				_dlssFgPresentedFrameCount = 0;
