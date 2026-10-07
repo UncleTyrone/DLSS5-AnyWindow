@@ -58,6 +58,9 @@ bool FrameSourceBase::Initialize(DeviceResources& deviceResources, BackendDescri
 
 FrameSourceState FrameSourceBase::Update() noexcept {
 	const FrameSourceState state = _Update();
+	if (state == FrameSourceState::NewFrame) {
+		++_sourceFrameCounts.checked;
+	}
 
 	const ScalingOptions& options = ScalingWindow::Get().Options();
 	const auto duplicateFrameDetectionMode = options.duplicateFrameDetectionMode;

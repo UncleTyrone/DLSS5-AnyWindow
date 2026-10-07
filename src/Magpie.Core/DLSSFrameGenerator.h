@@ -47,6 +47,9 @@ public:
 		return _requestedSettings;
 	}
 	uint32_t Multiplier() const noexcept;
+	// Generated frames for the next Draw, clamped to Multiplier() - 1. Zero
+	// still feeds the frame to DLSS so its history stays continuous.
+	void SetGeneratedFrameCount(uint32_t count) noexcept;
 
 private:
 	std::unique_ptr<Impl> _impl;

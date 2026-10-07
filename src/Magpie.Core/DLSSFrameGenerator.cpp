@@ -38,6 +38,7 @@ struct DLSSFrameGenerator::Impl {
 	uint32_t renderWidth = 0;
 	uint32_t renderHeight = 0;
 	uint32_t multiplier = 2;
+	uint32_t nextGeneratedFrames = 1;
 	DLSSFrameGenerationSettings settings{};
 	FrameGuidanceFrameId lastGuidanceResetFrameId =
 		std::numeric_limits<FrameGuidanceFrameId>::max();
@@ -339,6 +340,7 @@ bool DLSSFrameGenerator::Initialize(
 			_requestedSettings.multiplier,
 			maxGeneratedFrames + 1, impl->multiplier));
 	}
+	impl->nextGeneratedFrames = impl->multiplier - 1;
 
 	const uint32_t neverProvidedFlags =
 		NVSDK_NGX_DLSSG_ResourceFlags_HUDLess |
@@ -427,6 +429,12 @@ uint32_t DLSSFrameGenerator::Multiplier() const noexcept {
 	return _impl ? _impl->multiplier : _requestedSettings.multiplier;
 }
 
+void DLSSFrameGenerator::SetGeneratedFrameCount(uint32_t count) noexcept {
+	if (_impl) {
+		_impl->nextGeneratedFrames = std::min(count, _impl->multiplier - 1);
+	}
+}
+
 bool DLSSFrameGenerator::Draw(
 	ID3D11Texture2D* input,
 	FrameGuidanceFrameId frameId,
@@ -496,7 +504,9 @@ bool DLSSFrameGenerator::Draw(
 		return false;
 	}
 
-	const uint32_t generatedFrameCount = impl.resetHistory ? 1 : impl.multiplier - 1;
+	const bool ingestOnly = impl.resetHistory || impl.nextGeneratedFrames == 0;
+	const uint32_t generatedFrameCount =
+		ingestOnly ? 1 : impl.nextGeneratedFrames;
 	for (uint32_t frameIndex = 1; frameIndex <= generatedFrameCount; ++frameIndex) {
 		hr = impl.allocator12->Reset();
 		if (SUCCEEDED(hr)) {
@@ -623,7 +633,7 @@ bool DLSSFrameGenerator::Draw(
 		if (FAILED(hr)) {
 			return false;
 		}
-		if (!impl.resetHistory && !publishGeneratedFrame(impl.sharedGenerated11.get())) {
+		if (!ingestOnly && !publishGeneratedFrame(impl.sharedGenerated11.get())) {
 			return false;
 		}
 	}
@@ -671,6 +681,7 @@ DLSSFrameGenerator::GetFrameGuidanceRequirements() const noexcept { return {}; }
 uint32_t DLSSFrameGenerator::Multiplier() const noexcept {
 	return _requestedSettings.multiplier;
 }
+void DLSSFrameGenerator::SetGeneratedFrameCount(uint32_t) noexcept {}
 
 }
 

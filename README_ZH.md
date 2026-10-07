@@ -24,7 +24,7 @@ Magpie 是一个轻量级的窗口超分辨率工具，内置众多高效的算�
 Fork 维护者使用 OpenAI Codex 辅助开发和测试了以下基于捕获帧的实验功能：
 
 - NVIDIA DLSS Super Resolution：复用 NVIDIA Optical Flow 运动信息，并可选使用估算深度。
-- NVIDIA DLSS Frame Generation：可配置 x2/x3/x4 输出，并复用同一份 Frame Guidance。
+- NVIDIA DLSS Frame Generation：以显示器刷新率为目标，x2/x3/x4 设置作为倍率上限，并复用同一份 Frame Guidance。
 - NVIDIA DLSSNR：通过本地提供的直接运行时实现同分辨率 SDR AI 滤镜。
 - AMD FidelityFX Super Resolution 2.2.1：零运动向量、伪 jitter 元数据或 50% 分辨率颜色光流。
 - AMD FidelityFX Super Resolution 3.1.5 上采样（不含帧生成）：通过 D3D11/D3D12 互操作提供零运动向量、伪 jitter 元数据或 50% 分辨率颜色光流模式。
@@ -84,11 +84,30 @@ DLSS FG 位于效果链之后，可复用与 DLSS SR 相同捕获帧的运动信
 
 | Effect | 硬件与倍率 | 当前状态 |
 | --- | --- | --- |
-| `DLSS FG_Experimental` | NVIDIA RTX；可配置 x2/x3/x4 | Motion 默认开启，Estimated Depth 默认关闭；共享 D3D11/D3D12 资源使用同一捕获基础帧 ID。重复失败时保留真实帧，并只在当前缩放会话禁用 DLSSFG。 |
+| `DLSS FG_Experimental` | NVIDIA RTX；x2/x3/x4 为上限，按刷新率自动调整 | Motion 默认开启，Estimated Depth 默认关闭；输出以显示器刷新率为目标，最低 1x、最高为设置倍率。共享 D3D11/D3D12 资源使用同一捕获基础帧 ID。重复失败时保留真实帧，并只在当前缩放会话禁用 DLSSFG。 |
 | XeSS Frame Generation x2 Zero-MV | 兼容的 Intel、NVIDIA 和 AMD GPU；x2 | 使用 XeSS-FG D3D12 代理交换链的通用显卡实验路径。 |
 | XeSS Multi-Frame Generation x2-x4 Zero-MV | Intel Arc；x2/x3/x4 | Arc 多帧生成实验路径。请求倍率会限制在 GPU 和驱动报告的能力范围内；非 Arc 硬件会限制或回退到 x2。 |
 
 这些路径可以提高显示帧率，但缺少游戏原生接入时，无法正确重建物体运动、UI 分离、反遮挡和镜头变化。它们可能增加延迟或产生插帧伪影，需要针对具体应用测试。
+
+#### DLSS FG 刷新率目标
+
+`DLSS FG_Experimental` 的 `Frame Multiplier` 是上限，而不是固定倍率。每张生成帧占用一次显示器刷新；如果呈现的帧数超过显示器能显示的数量，真实捕获帧就会排队或被丢弃，DLSS 只能在更大、更不均匀的间隔之间插帧，结果是帧率没有提高，鬼影反而增加。
+
+因此 DLSS FG 以显示缩放窗口的显示器刷新率为目标：
+
+- 帧生成启动时读取显示器刷新率。
+- 每 0.5 秒测量一次源的真实帧率：统计 Windows Graphics Capture 交付的全部帧（包括后端繁忙时被跳过的旧帧），再乘以重复帧过滤保留的比例。因此呈现跟不上时，测得的帧率不会随之下降。
+- 每张真实帧的生成帧数 = 刷新率 ÷ 源帧率 − 1，限制在 0 到 `Frame Multiplier` − 1 之间。小数目标会分摊到各真实帧，例如 1.5x 会交替生成 1 张和 0 张。
+- 不生成帧的真实帧仍会送入 DLSS，保持帧生成历史连续。
+
+| 显示器 | 源 | 倍率 2x | 倍率 3x | 倍率 4x |
+| --- | --- | --- | --- | --- |
+| 240 Hz | 约 105 FPS | 2x | 约 2.3x | 约 2.3x |
+| 240 Hz | 60 FPS | 2x | 3x | 4x |
+| 90 Hz | 60 FPS | 1.5x | 1.5x | 1.5x |
+
+该行为没有开关。每秒一行的 `DLSSFG presentation` 日志会显示测得的 `source` 帧率和当前 `target` 倍率。生成帧通过 FLIP_SEQUENTIAL、允许撕裂、最大帧延迟为 1 的交换链连续呈现；帧路径中没有基于 sleep 的节奏控制或呈现队列。
 
 #### FSR 2.2.1
 
@@ -145,6 +164,7 @@ XeSS 使用跨厂商 D3D12 DP4a 路径，可以在兼容的 Intel、NVIDIA 和 A
 
 - [Magpie 原始仓库](https://github.com/Blinue/Magpie)
 - [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS)
+- [NVIDIA Optical Flow SDK](https://developer.nvidia.com/opticalflow-sdk) 中的 Optical Flow API 头文件（`nvOpticalFlowCommon.h`、`nvOpticalFlowD3D11.h`），通过 `EnableNvidiaOpticalFlow` 和 `NvidiaOpticalFlowSdkDir` 启用。运行时 `nvofapi64.dll` 随 NVIDIA 驱动提供并动态加载；未启用时使用软件半分辨率光流。
 - [AMD FidelityFX FSR 2.2.1](https://github.com/GPUOpen-Effects/FidelityFX-FSR2/tree/v2.2.1)
 - [社区 FSR2 DirectX 11 后端](https://github.com/gameplug-labs/FidelityFX-FSR2-DX11)
 - [AMD FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)

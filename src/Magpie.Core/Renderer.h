@@ -102,6 +102,8 @@ private:
 		bool isNewCaptureFrame
 	) noexcept;
 
+	uint32_t _NextDLSSFrameGenerationCount() noexcept;
+
 	bool _PublishBackendTexture(ID3D11Texture2D* texture, bool synchronous) noexcept;
 
 	bool _InitializeDLSSFrameGenerator(
@@ -145,12 +147,19 @@ private:
 	std::unique_ptr<FrameSourceBase> _frameSource;
 	FrameGuidanceService _frameGuidanceService;
 	FrameGuidanceFrameId _capturedFrameId = 0;
-	std::chrono::steady_clock::time_point _lastCapturedFrameTime{};
 	std::vector<EffectDrawer> _effectDrawers;
 	std::vector<std::unique_ptr<class NativeEffectBackend>> _nativeEffectBackends;
 	std::unique_ptr<class DLSSFrameGenerator> _dlssFrameGenerator;
 	uint32_t _dlssFgConsecutiveFailures = 0;
 	uint32_t _dlssFgRecoveryAttempts = 0;
+	float _dlssFgRefreshHz = 0.0f;
+	std::chrono::steady_clock::time_point _dlssFgRateWindowStart{};
+	uint32_t _dlssFgRateWindowFrames = 0;
+	double _dlssFgSourceFps = 0.0;
+	// Average generated frames per real frame; fractional values are spread
+	// across real frames by the accumulator.
+	double _dlssFgGenerated = -1.0;
+	double _dlssFgGeneratedAcc = 0.0;
 
 	StepTimer _stepTimer;
 	EffectsProfiler _effectsProfiler;
@@ -171,10 +180,6 @@ private:
 	std::atomic<bool> _synchronousFramePresentationEnabled = false;
 	float _frameRateFilterTarget = 0.0f;
 	std::chrono::nanoseconds _synchronousPresentInterval{};
-	std::chrono::nanoseconds _dlssFgPaceSlot{};
-	std::chrono::steady_clock::time_point _dlssFgPaceAnchor{};
-	uint32_t _dlssFgPresentsRemaining = 0;
-	uint32_t _dlssFgPaceIndex = 0;
 	std::chrono::steady_clock::time_point _dlssFgDiagnosticsStart{};
 	uint32_t _dlssFgCapturedFrameCount = 0;
 	uint32_t _dlssFgPresentedFrameCount = 0;

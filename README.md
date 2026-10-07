@@ -24,7 +24,7 @@ This repository is an independent experimental fork of [Blinue/Magpie](https://g
 The fork owner used OpenAI Codex as a development assistant to add and test experimental captured-frame integrations for:
 
 - NVIDIA DLSS Super Resolution with shared NVIDIA Optical Flow motion and optional estimated depth.
-- NVIDIA DLSS Frame Generation with configurable 2x/3x/4x output and the same shared guidance.
+- NVIDIA DLSS Frame Generation that targets the display refresh rate, using the configured 2x/3x/4x multiplier as a ceiling, with the same shared guidance.
 - NVIDIA DLSSNR as a same-resolution SDR AI filter through a locally supplied direct-runtime path.
 - AMD FidelityFX Super Resolution 2.2.1 with zero motion vectors, synthetic jitter metadata, or 50%-resolution colour optical flow.
 - AMD FidelityFX Super Resolution 3.1.5 upscaling (without frame generation) through D3D11/D3D12 interoperability, with zero motion vectors, synthetic jitter metadata, or 50%-resolution colour optical flow.
@@ -84,11 +84,30 @@ While Frame Generation is active, Magpie forces exact duplicate-frame filtering 
 
 | Effect | Hardware and multiplier | Current status |
 | --- | --- | --- |
-| `DLSS FG_Experimental` | NVIDIA RTX; configurable x2/x3/x4 | Motion defaults on; estimated depth defaults off. Shared D3D11/D3D12 resources use the same captured base-frame ID. Failure protection preserves real frames and disables DLSSFG only for the current scaling session after repeated failures. |
+| `DLSS FG_Experimental` | NVIDIA RTX; x2/x3/x4 ceiling, refresh-targeted | Motion defaults on; estimated depth defaults off. Output targets the display refresh rate, down to 1x and up to the configured multiplier. Shared D3D11/D3D12 resources use the same captured base-frame ID. Failure protection preserves real frames and disables DLSSFG only for the current scaling session after repeated failures. |
 | XeSS Frame Generation x2 Zero-MV | Compatible Intel, NVIDIA, and AMD GPUs; x2 | Experimental cross-vendor path using the XeSS-FG D3D12 proxy swap chain. |
 | XeSS Multi-Frame Generation x2-x4 Zero-MV | Intel Arc; x2/x3/x4 | Experimental Arc multi-frame path. The requested multiplier is clamped to the capability reported by the GPU and driver; non-Arc hardware is limited or falls back to x2. |
 
 These paths can increase displayed frame rate but cannot reconstruct correct object motion, UI separation, disocclusion, or camera changes without game integration. They may add latency or visible interpolation artefacts and should be tested per application.
+
+#### DLSS FG refresh-rate targeting
+
+`Frame Multiplier` on `DLSS FG_Experimental` is a ceiling, not a fixed rate. Each generated frame occupies one display refresh, so presenting more frames than the display can show makes real captured frames wait or get dropped, and DLSS then has to interpolate across larger, uneven gaps. That shows up as ghosting with no gain in frame rate.
+
+DLSS FG therefore aims output at the refresh rate of the monitor showing the scaled window:
+
+- The refresh rate is read when frame generation starts.
+- Every 0.5 s, Magpie measures the source's real frame rate. It counts every frame Windows Graphics Capture delivered, including older frames drained while the backend was busy, and scales that by the share the duplicate-frame filter kept. The measurement therefore does not fall when presentation falls behind.
+- Generated frames per real frame = refresh ÷ source FPS − 1, clamped between 0 and `Frame Multiplier` − 1. Fractional targets are spread across real frames; 1.5x, for example, alternates one and zero generated frames.
+- A real frame that receives no generated frame is still fed to DLSS, so frame-generation history stays continuous.
+
+| Display | Source | Multiplier 2x | Multiplier 3x | Multiplier 4x |
+| --- | --- | --- | --- | --- |
+| 240 Hz | ~105 FPS | 2x | ~2.3x | ~2.3x |
+| 240 Hz | 60 FPS | 2x | 3x | 4x |
+| 90 Hz | 60 FPS | 1.5x | 1.5x | 1.5x |
+
+There is no switch for this behaviour. Each per-second `DLSSFG presentation` log line reports the measured `source` FPS and the current `target` multiplier. Generated frames are presented back-to-back on a FLIP_SEQUENTIAL tearing swap chain with a maximum frame latency of 1; no sleep-based pacing or present queue sits in the frame path.
 
 #### FSR 2.2.1
 
@@ -145,6 +164,7 @@ Third-party SDKs, models, wheels, and proprietary NVIDIA binaries are not part o
 
 - [Original Magpie repository](https://github.com/Blinue/Magpie)
 - [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS)
+- NVIDIA Optical Flow API headers (`nvOpticalFlowCommon.h`, `nvOpticalFlowD3D11.h`) from the [NVIDIA Optical Flow SDK](https://developer.nvidia.com/opticalflow-sdk), enabled with `EnableNvidiaOpticalFlow` and `NvidiaOpticalFlowSdkDir`. The runtime `nvofapi64.dll` ships with the NVIDIA driver and is loaded dynamically; builds without it use the software half-resolution flow.
 - [AMD FidelityFX FSR 2.2.1](https://github.com/GPUOpen-Effects/FidelityFX-FSR2/tree/v2.2.1)
 - [Community FSR2 DirectX 11 backend](https://github.com/gameplug-labs/FidelityFX-FSR2-DX11)
 - [AMD FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)

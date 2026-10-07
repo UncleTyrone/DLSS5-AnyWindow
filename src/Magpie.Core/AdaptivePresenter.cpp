@@ -45,10 +45,9 @@ bool AdaptivePresenter::_Initialize(HWND hwndAttach) noexcept {
 		// 如果两种渲染方式无法无缝切换，DXGI_SCALING_STRETCH 使视觉变化尽可能小
 		.Scaling = DXGI_SCALING_STRETCH,
 #endif
-		// DLSS FG presents interpolated then real frames in one capture. FLIP_DISCARD
-		// + Present(0) drops unread interpolations, so the display only shows the
-		// latest real frame at the capture rate. FLIP_SEQUENTIAL keeps each unique
-		// generated frame until scanout can display it.
+		// FLIP_DISCARD + Present(0) drops unread interpolations, so Elgato only
+		// sees the latest real frame. FLIP_SEQUENTIAL keeps each generated frame
+		// until scanout. The queue stays one frame (latency 1).
 		.SwapEffect = useDlssFgSwapChain
 			? DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
 			: DXGI_SWAP_EFFECT_FLIP_DISCARD,
@@ -91,8 +90,7 @@ bool AdaptivePresenter::_Initialize(HWND hwndAttach) noexcept {
 	if (maximumFrameLatency == 1) {
 		Logger::Get().Info(fmt::format(
 			"DLSSFG swap-chain maximum frame latency: 1, tearingPresent={}, flipSequential=true",
-			_useTearingPresent
-		));
+			_useTearingPresent));
 	}
 
 	_frameLatencyWaitableObject.reset(_dxgiSwapChain->GetFrameLatencyWaitableObject());
@@ -144,35 +142,7 @@ bool AdaptivePresenter::BeginFrame(
 		drawOffset = {};
 
 		if (!_isframeLatencyWaited) {
-			static uint64_t waitCount = 0;
-			static double waitTotalMs = 0.0;
-			static auto lastWaitLog = std::chrono::steady_clock::now();
-		
-			const auto waitStart = std::chrono::steady_clock::now();
 			_frameLatencyWaitableObject.wait(1000);
-			const auto waitEnd = std::chrono::steady_clock::now();
-		
-			waitTotalMs += std::chrono::duration<double, std::milli>(
-				waitEnd - waitStart
-			).count();
-			++waitCount;
-		
-			const double elapsed =
-				std::chrono::duration<double>(waitEnd - lastWaitLog).count();
-		
-			if (elapsed >= 1.0) {
-				Logger::Get().Info(fmt::format(
-					"PRESENTER DIAG: latency wait avg={:.3f} ms, waits={} ({:.1f}/s)",
-					waitTotalMs / double(waitCount),
-					waitCount,
-					double(waitCount) / elapsed
-				));
-		
-				waitCount = 0;
-				waitTotalMs = 0.0;
-				lastWaitLog = waitEnd;
-			}
-		
 			_isframeLatencyWaited = true;
 		}
 
@@ -216,61 +186,13 @@ void AdaptivePresenter::EndFrame(bool waitForGpu) noexcept {
 	if (_isDCompPresenting) {
 		_dcompDevice->Commit();
 	} else {
-		// 两个垂直同步之间允许渲染数帧，SyncInterval = 0 只呈现最新的一帧，旧帧被丢弃
-		static uint64_t presentCount = 0;
-		static uint64_t presentFailures = 0;
-		static uint64_t refreshDeltaAccum = 0;
-		static auto lastPresentLog = std::chrono::steady_clock::now();
-
 		UINT presentFlags = _useTearingPresent ? DXGI_PRESENT_ALLOW_TEARING : 0;
 		HRESULT presentHr = _dxgiSwapChain->Present(0, presentFlags);
 		if (presentHr == DXGI_ERROR_INVALID_CALL && presentFlags != 0) {
 			_useTearingPresent = false;
-			presentFlags = 0;
 			Logger::Get().Warn(
 				"DLSSFG DXGI_PRESENT_ALLOW_TEARING rejected; falling back to Present(0, 0)");
 			presentHr = _dxgiSwapChain->Present(0, 0);
-		}
-		++presentCount;
-
-		if (FAILED(presentHr)) {
-			++presentFailures;
-		}
-
-		UINT dxgiPresentCount = 0;
-		HRESULT statsHr = DXGI_ERROR_UNSUPPORTED;
-		_dxgiSwapChain->GetLastPresentCount(&dxgiPresentCount);
-		DXGI_FRAME_STATISTICS stats{};
-		statsHr = _dxgiSwapChain->GetFrameStatistics(&stats);
-		if (SUCCEEDED(statsHr)) {
-			if (_haveDxgiStats) {
-				refreshDeltaAccum += stats.PresentRefreshCount - _lastDxgiRefreshCount;
-			}
-			_lastDxgiPresentCount = stats.PresentCount;
-			_lastDxgiRefreshCount = stats.PresentRefreshCount;
-			_haveDxgiStats = true;
-		}
-
-		const auto presentNow = std::chrono::steady_clock::now();
-		const double presentElapsed =
-			std::chrono::duration<double>(presentNow - lastPresentLog).count();
-
-		if (presentElapsed >= 1.0) {
-			Logger::Get().Info(fmt::format(
-				"PRESENTER DIAG: Present={:.1f}/s, flags=0x{:08X}, failures={}, lastHr=0x{:08X}, statsHr=0x{:08X}, dxgiPresentCount={}, dxgiRefresh={:.1f}/s",
-				double(presentCount) / presentElapsed,
-				presentFlags,
-				presentFailures,
-				static_cast<uint32_t>(presentHr),
-				static_cast<uint32_t>(statsHr),
-				dxgiPresentCount,
-				double(refreshDeltaAccum) / presentElapsed
-			));
-
-			presentCount = 0;
-			presentFailures = 0;
-			refreshDeltaAccum = 0;
-			lastPresentLog = presentNow;
 		}
 		_isframeLatencyWaited = false;
 

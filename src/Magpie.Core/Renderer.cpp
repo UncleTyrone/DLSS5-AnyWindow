@@ -32,7 +32,6 @@
 #endif
 #include <dispatcherqueue.h>
 #include <d3dkmthk.h>
-#include <thread>
 
 namespace Magpie {
 
@@ -227,11 +226,6 @@ void Renderer::OnCursorVisibilityChanged(bool isVisible, bool onDestory) {
 	_backendThreadDispatcher.TryEnqueue([this, isVisible, onDestory]() {
 		if (_frameSource) {
 			_frameSource->OnCursorVisibilityChanged(isVisible, onDestory);
-			if (isVisible && !onDestory &&
-				_frameGuidanceService.IsInitialized()) {
-				_frameGuidanceService.ResetHistory(
-					FrameGuidanceResetReason::CaptureInterrupted);
-			}
 		}
 	});
 }
@@ -922,16 +916,9 @@ bool Renderer::_InitializeDLSSFrameGenerator(
 			(int64_t)std::llround(1'000'000'000.0 / outputFrameRate));
 	} else {
 		_synchronousPresentInterval = {};
-		const uint32_t multiplier = std::max(frameGenerator->Multiplier(), 1u);
-		_dlssFgPaceSlot = std::chrono::nanoseconds(
-			(int64_t)std::llround(1'000'000'000.0 / (60.0 * double(multiplier))));
-		Logger::Get().Info(fmt::format(
-			"DLSSFG present pacing enabled: default slot={:.2f} ms, multiplier={}x",
-			_dlssFgPaceSlot.count() / 1'000'000.0,
-			multiplier
-		));
 	}
 	_dlssFrameGenerator = std::move(frameGenerator);
+	_dlssFgGenerated = -1.0;
 	return true;
 }
 
@@ -965,7 +952,6 @@ void Renderer::_HandleDLSSFrameGenerationFailure(ID3D11Texture2D* input) noexcep
 void Renderer::_DisableDLSSFrameGenerationForSession() noexcept {
 	_dlssFrameGenerator.reset();
 	_synchronousPresentInterval = {};
-	_dlssFgPresentsRemaining = 0;
 	_overlayFps.store(0, std::memory_order_relaxed);
 	Logger::Get().Error(
 		"DLSS Frame Generation was disabled for this scaling session after repeated failures");
@@ -1299,25 +1285,10 @@ void Renderer::_BackendRender(
 	bool isNewCaptureFrame
 ) noexcept {
 	_stepTimer.PrepareForRender();
+	if (isNewCaptureFrame && _dlssFrameGenerator) {
+		_dlssFrameGenerator->SetGeneratedFrameCount(_NextDLSSFrameGenerationCount());
+	}
 	if (isNewCaptureFrame) {
-		const auto captureTime = std::chrono::steady_clock::now();
-		if (_lastCapturedFrameTime != std::chrono::steady_clock::time_point{} &&
-			captureTime - _lastCapturedFrameTime >= std::chrono::milliseconds(500) &&
-			_frameGuidanceService.IsInitialized()) {
-			_frameGuidanceService.ResetHistory(FrameGuidanceResetReason::LongPause);
-		}
-		if (_dlssFrameGenerator &&
-			_lastCapturedFrameTime != std::chrono::steady_clock::time_point{} &&
-			_synchronousPresentInterval.count() == 0) {
-			const auto captureDelta = captureTime - _lastCapturedFrameTime;
-			if (captureDelta > std::chrono::milliseconds(4) &&
-				captureDelta < std::chrono::milliseconds(250)) {
-				const uint32_t multiplier = std::max(_dlssFrameGenerator->Multiplier(), 1u);
-				_dlssFgPaceSlot = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					captureDelta / multiplier);
-			}
-		}
-		_lastCapturedFrameTime = captureTime;
 		++_capturedFrameId;
 		const FrameGuidanceRequirements guidanceRequirements =
 			CollectFrameGuidanceRequirements(
@@ -1329,8 +1300,6 @@ void Renderer::_BackendRender(
 	}
 	if (_dlssFrameGenerator) {
 		++_dlssFgCapturedFrameCount;
-		_dlssFgPresentsRemaining = std::max(_dlssFrameGenerator->Multiplier(), 1u);
-		_dlssFgPaceIndex = 0;
 	}
 
 	ID3D11DeviceContext4* d3dDC = _backendResources.GetD3DDC();
@@ -1391,6 +1360,64 @@ void Renderer::_BackendRender(
 	_effectsProfiler.QueryTimings(d3dDC);
 }
 
+static float QueryOutputRefreshRate() noexcept {
+	if (HMONITOR hMon = MonitorFromWindow(
+		ScalingWindow::Get().Handle(), MONITOR_DEFAULTTONEAREST)) {
+		MONITORINFOEX mi{ { sizeof(MONITORINFOEX) } };
+		DEVMODE dm{ .dmSize = sizeof(DEVMODE) };
+		if (GetMonitorInfo(hMon, &mi) &&
+			EnumDisplaySettings(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
+			dm.dmDisplayFrequency > 1) {
+			return float(dm.dmDisplayFrequency);
+		}
+	}
+	return 60.0f;
+}
+
+uint32_t Renderer::_NextDLSSFrameGenerationCount() noexcept {
+	const double maxGenerated = double(_dlssFrameGenerator->Multiplier() - 1);
+	const auto now = std::chrono::steady_clock::now();
+	if (_dlssFgGenerated < 0) {
+		_dlssFgRefreshHz = QueryOutputRefreshRate();
+		_dlssFgGenerated = maxGenerated;
+		_dlssFgGeneratedAcc = 0.0;
+		_dlssFgRateWindowStart = now;
+		_dlssFgRateWindowFrames = 0;
+		_frameSource->TakeSourceFrameCounts();
+		Logger::Get().Info(fmt::format(
+			"DLSSFG targeting {} Hz refresh, up to {}x",
+			_dlssFgRefreshHz, _dlssFrameGenerator->Multiplier()));
+	} else {
+		++_dlssFgRateWindowFrames;
+	}
+
+	// Real frames per second the source actually produces: everything the
+	// capture API delivered, scaled by the share that duplicate filtering
+	// kept. Measured this way it doesn't drop when presenting falls behind.
+	const double elapsed = std::chrono::duration<double>(
+		now - _dlssFgRateWindowStart).count();
+	if (elapsed >= 0.5) {
+		const FrameSourceBase::SourceFrameCounts counts =
+			_frameSource->TakeSourceFrameCounts();
+		const uint32_t arrived = counts.arrived ? counts.arrived : counts.checked;
+		const double uniqueShare = counts.checked ?
+			std::min(double(_dlssFgRateWindowFrames) / counts.checked, 1.0) : 1.0;
+		const double sourceFps = arrived / elapsed * uniqueShare;
+		_dlssFgSourceFps = sourceFps;
+		if (sourceFps > 1.0) {
+			_dlssFgGenerated = std::clamp(
+				_dlssFgRefreshHz / sourceFps - 1.0, 0.0, maxGenerated);
+		}
+		_dlssFgRateWindowStart = now;
+		_dlssFgRateWindowFrames = 0;
+	}
+
+	_dlssFgGeneratedAcc += _dlssFgGenerated;
+	const uint32_t count = (uint32_t)(_dlssFgGeneratedAcc + 1e-6);
+	_dlssFgGeneratedAcc -= count;
+	return count;
+}
+
 bool Renderer::_PublishBackendTexture(
 	ID3D11Texture2D* texture,
 	bool synchronous
@@ -1443,21 +1470,13 @@ bool Renderer::_PublishBackendTexture(
 		)) {
 			return false;
 		}
-		++_dlssFgPaceIndex;
-		const bool morePresentsThisCapture = _dlssFgPresentsRemaining > 1;
-		if (_dlssFgPresentsRemaining > 0) {
-			--_dlssFgPresentsRemaining;
-		}
-
+		// Waiting on DWM after every generated frame holds the capture thread
+		// at about one refresh per present, which lands near 30 FPS at 4x.
+		// Only pace when a frame-rate filter is set.
 		if (_synchronousPresentInterval.count() > 0) {
 			do {
 				Win32Helper::WaitForDwmComposition();
 			} while (std::chrono::steady_clock::now() - presentStart < _synchronousPresentInterval);
-		} else if (morePresentsThisCapture && _dlssFgPaceSlot.count() > 0) {
-			if (_dlssFgPaceIndex == 1) {
-				_dlssFgPaceAnchor = presentStart;
-			}
-			std::this_thread::sleep_until(_dlssFgPaceAnchor + _dlssFgPaceIndex * _dlssFgPaceSlot);
 		}
 
 		++_dlssFgPresentedFrameCount;
@@ -1473,10 +1492,12 @@ bool Renderer::_PublishBackendTexture(
 					uint32_t(std::lround(submittedFps)),
 					std::memory_order_relaxed);
 				Logger::Get().Info(fmt::format(
-					"DLSSFG presentation: captured={:.1f} FPS, submitted={:.1f} FPS, paceSlot={:.2f} ms",
+					"DLSSFG presentation: captured={:.1f} FPS, submitted={:.1f} FPS, "
+					"source={:.1f} FPS, target={:.2f}x",
 					_dlssFgCapturedFrameCount / elapsed,
 					submittedFps,
-					_dlssFgPaceSlot.count() / 1'000'000.0));
+					_dlssFgSourceFps,
+					1.0 + std::max(_dlssFgGenerated, 0.0)));
 				_dlssFgDiagnosticsStart = now;
 				_dlssFgCapturedFrameCount = 0;
 				_dlssFgPresentedFrameCount = 0;

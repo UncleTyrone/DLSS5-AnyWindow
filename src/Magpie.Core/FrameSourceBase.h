@@ -43,6 +43,17 @@ public:
 
 	std::pair<uint32_t, uint32_t> GetStatisticsForDynamicDetection() const noexcept;
 
+	struct SourceFrameCounts {
+		// Frames the capture API delivered, including older ones drained
+		// unseen while the backend was busy. Zero if the source can't tell.
+		uint32_t arrived = 0;
+		// Frames handed to duplicate filtering.
+		uint32_t checked = 0;
+	};
+	SourceFrameCounts TakeSourceFrameCounts() noexcept {
+		return std::exchange(_sourceFrameCounts, {});
+	}
+
 	virtual const char* Name() const noexcept = 0;
 
 	virtual FrameSourceWaitType WaitType() const noexcept = 0;
@@ -75,6 +86,7 @@ protected:
 	winrt::com_ptr<ID3D11Buffer> _readBackBuffer;
 	winrt::com_ptr<ID3D11ComputeShader> _dupFrameCS;
 	std::pair<uint32_t, uint32_t> _dispatchCount;
+	SourceFrameCounts _sourceFrameCounts;
 
 private:
 	bool _InitCheckingForDuplicateFrame();

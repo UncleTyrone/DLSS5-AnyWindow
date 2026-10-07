@@ -90,10 +90,12 @@ FrameSourceState GraphicsCaptureFrameSource::_Update() noexcept {
 		return FrameSourceState::Waiting;
 	}
 
+	++_sourceFrameCounts.arrived;
 	// 取最新帧，帧率较低时可以有效降低延迟
 	while (true) {
 		if (winrt::Direct3D11CaptureFrame nextFrame = _captureFramePool.TryGetNextFrame()) {
 			frame = std::move(nextFrame);
+			++_sourceFrameCounts.arrived;
 		} else {
 			break;
 		}

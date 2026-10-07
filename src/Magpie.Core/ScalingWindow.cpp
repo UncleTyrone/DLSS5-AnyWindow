@@ -422,9 +422,14 @@ void ScalingWindow::Render() noexcept {
 	bool isSrcRepositioning = false;
 	bool srcFocusedChanged = false;
 	if (!_UpdateSrcState(isSrcRepositioning, srcFocusedChanged)) {
-		Logger::Get().Info("源窗口状态改变");
-		_DelayedStop(false, isSrcRepositioning);
-		return;
+		// The first render can land while the scaling window is still being
+		// created and the source rect is mid-change. Stopping there closes
+		// scaling before the window is shown.
+		if (!_isFirstFrame) {
+			Logger::Get().Info("源窗口状态改变");
+			_DelayedStop(false, isSrcRepositioning);
+			return;
+		}
 	}
 
 	if (srcFocusedChanged) {
