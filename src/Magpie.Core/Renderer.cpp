@@ -113,6 +113,9 @@ static void SetGpuPriority() noexcept {
 }
 
 ScalingError Renderer::Initialize(HWND hwndAttach, OverlayOptions& overlayOptions) noexcept {
+	_doubleBufferedHandoff = std::ranges::any_of(
+		ScalingWindow::Get().Options().effects,
+		[](const EffectOption& effect) { return IsDLSSFrameGenerationEffect(effect.name); });
 	_backendThread = std::thread(&Renderer::_BackendThreadProc, this);
 
 	if (!_frontendResources.Initialize(true)) {
@@ -146,6 +149,7 @@ ScalingError Renderer::Initialize(HWND hwndAttach, OverlayOptions& overlayOption
 	}
 	const bool useXeSSFrameGeneration = xessFrameGenerationEffectCount == 1;
 	_isXeSSFrameGenerationActive = useXeSSFrameGeneration;
+	_isDLSSFrameGenerationActive = useDLSSFrameGeneration;
 	if (useXeSSFrameGeneration && useDLSSFrameGeneration) {
 		Logger::Get().Error("XeSSFG and DLSSFG cannot be enabled in the same effect chain");
 		return ScalingError::ScalingFailedGeneral;
@@ -180,15 +184,9 @@ ScalingError Renderer::Initialize(HWND hwndAttach, OverlayOptions& overlayOption
 		return _backendInitError == ScalingError::NoError ? ScalingError::ScalingFailedGeneral : _backendInitError;
 	}
 
-	// 获取共享纹理
-	HRESULT hr = _frontendResources.GetD3DDevice()->OpenSharedResource(
-		sharedTextureHandle, IID_PPV_ARGS(_frontendSharedTexture.put()));
-	if (FAILED(hr)) {
-		Logger::Get().ComError("OpenSharedResource 失败", hr);
+	if (!_OpenFrontendSharedTextures(sharedTextureHandle)) {
 		return ScalingError::ScalingFailedGeneral;
 	}
-
-	_frontendSharedTextureMutex = _frontendSharedTexture.try_as<IDXGIKeyedMutex>();
 
 	_UpdateDestRect();
 
@@ -197,7 +195,7 @@ ScalingError Renderer::Initialize(HWND hwndAttach, OverlayOptions& overlayOption
 		_destRect.right - _destRect.left, _destRect.bottom - _destRect.top));
 
 	if (!_cursorDrawer.Initialize(_frontendResources)) {
-		Logger::Get().ComError("初始化 CursorDrawer 失败", hr);
+		Logger::Get().Error("初始化 CursorDrawer 失败");
 		return ScalingError::ScalingFailedGeneral;
 	}
 
@@ -283,15 +281,150 @@ winrt::fire_and_forget Renderer::TakeScreenshot(
 	}
 }
 
-void Renderer::_FrontendRender(bool waitForGpu) noexcept {
-	winrt::com_ptr<ID3D11Texture2D> frameTex;
-	winrt::com_ptr<ID3D11RenderTargetView> frameRtv;
-	POINT drawOffset;
-	if (!_presenter->BeginFrame(frameTex, frameRtv, drawOffset)) {
-		return;
+bool Renderer::_AcquireFrontendSharedTexture() noexcept {
+	_lastAccessMutexKey = ++_sharedTextureMutexKey;
+	HRESULT hr = _frontendSharedTextureMutex->AcquireSync(_lastAccessMutexKey - 1, INFINITE);
+	if (FAILED(hr)) {
+		Logger::Get().ComError("AcquireSync 失败", hr);
+		return false;
+	}
+	return true;
+}
+
+void Renderer::_ReleaseFrontendSharedTexture() noexcept {
+	_frontendSharedTextureMutex->ReleaseSync(_lastAccessMutexKey);
+
+	_frontendConsumedKey.store(_lastAccessMutexKey - 1, std::memory_order_release);
+	if (_frontendConsumedEvent) {
+		SetEvent(_frontendConsumedEvent.get());
+	}
+}
+
+bool Renderer::_OpenFrontendSharedTextures(HANDLE sharedHandle) noexcept {
+	// 获取共享纹理
+	ID3D11Device5* d3dDevice = _frontendResources.GetD3DDevice();
+	HRESULT hr = d3dDevice->OpenSharedResource(
+		sharedHandle, IID_PPV_ARGS(_frontendSharedTexture.put()));
+	if (FAILED(hr)) {
+		Logger::Get().ComError("OpenSharedResource 失败", hr);
+		return false;
+	}
+	_frontendSharedTextureMutex = _frontendSharedTexture.try_as<IDXGIKeyedMutex>();
+
+	if (_doubleBufferedHandoff) {
+		hr = d3dDevice->OpenSharedResource(
+			_sharedTextureHandleAlt, IID_PPV_ARGS(_frontendSharedTextureAlt.put()));
+		if (FAILED(hr)) {
+			Logger::Get().ComError("OpenSharedResource 失败", hr);
+			return false;
+		}
+		_frontendSharedTextureMutexAlt = _frontendSharedTextureAlt.try_as<IDXGIKeyedMutex>();
+	}
+	return true;
+}
+
+// Consumes publishes in order so a generated frame is never skipped in favour
+// of the real frame published right after it.
+bool Renderer::_ConsumeDoubleBufferedFrame() noexcept {
+	const uint64_t published = _sharedTextureMutexKey.load(std::memory_order_acquire);
+	if (published <= _lastAccessMutexKey) {
+		// Cursor or overlay redraw; the staging texture still holds the last frame.
+		return true;
+	}
+
+	const uint64_t seq = _lastAccessMutexKey + 1;
+	const bool alt = (seq & 1) == 0;
+	IDXGIKeyedMutex* mutex = alt ? _frontendSharedTextureMutexAlt.get() : _frontendSharedTextureMutex.get();
+	ID3D11Texture2D* texture = alt ? _frontendSharedTextureAlt.get() : _frontendSharedTexture.get();
+
+	HRESULT hr = mutex->AcquireSync(1, 100);
+	if (hr != S_OK) {
+		Logger::Get().ComError("AcquireSync 失败", hr);
+		return false;
 	}
 
 	ID3D11DeviceContext4* d3dDC = _frontendResources.GetD3DDC();
+	d3dDC->CopyResource(_frontendStagingTexture.get(), texture);
+	mutex->ReleaseSync(0);
+	// The backend reuses this slot two publishes later and waits on this release
+	// on the GPU; without a flush it stays queued through the frame-latency wait.
+	d3dDC->Flush();
+
+	_lastAccessMutexKey = seq;
+	_frontendConsumedKey.store(seq, std::memory_order_release);
+	if (_frontendConsumedEvent) {
+		SetEvent(_frontendConsumedEvent.get());
+	}
+	return true;
+}
+
+void Renderer::_FrontendRender(bool waitForGpu) noexcept {
+	ID3D11DeviceContext4* d3dDC = _frontendResources.GetD3DDC();
+
+	ID3D11Texture2D* srcTex = _frontendSharedTexture.get();
+	const bool useStaging = _isDLSSFrameGenerationActive;
+	if (useStaging) {
+		D3D11_TEXTURE2D_DESC sharedDesc;
+		_frontendSharedTexture->GetDesc(&sharedDesc);
+
+		bool recreate = !_frontendStagingTexture;
+		if (!recreate) {
+			D3D11_TEXTURE2D_DESC stagingDesc;
+			_frontendStagingTexture->GetDesc(&stagingDesc);
+			recreate = stagingDesc.Width != sharedDesc.Width ||
+				stagingDesc.Height != sharedDesc.Height ||
+				stagingDesc.Format != sharedDesc.Format;
+		}
+		if (recreate) {
+			_frontendStagingTexture = nullptr;
+			D3D11_TEXTURE2D_DESC desc = sharedDesc;
+			desc.MiscFlags = 0;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			desc.CPUAccessFlags = 0;
+			desc.Usage = D3D11_USAGE_DEFAULT;
+			HRESULT hr = _frontendResources.GetD3DDevice()->CreateTexture2D(
+				&desc, nullptr, _frontendStagingTexture.put());
+			if (FAILED(hr)) {
+				Logger::Get().ComError("CreateTexture2D 失败", hr);
+				return;
+			}
+		}
+
+		if (_doubleBufferedHandoff) {
+			if (!_ConsumeDoubleBufferedFrame()) {
+				return;
+			}
+		} else {
+			if (!_AcquireFrontendSharedTexture()) {
+				return;
+			}
+			d3dDC->CopyResource(_frontendStagingTexture.get(), _frontendSharedTexture.get());
+			_ReleaseFrontendSharedTexture();
+			// The backend's next AcquireSync waits on this release on the GPU; without a
+			// flush it stays queued through the frame-latency wait below.
+			d3dDC->Flush();
+		}
+		srcTex = _frontendStagingTexture.get();
+	}
+
+	winrt::com_ptr<ID3D11Texture2D> frameTex;
+	winrt::com_ptr<ID3D11RenderTargetView> frameRtv;
+	POINT drawOffset;
+	{
+		const auto waitStart = std::chrono::steady_clock::now();
+		const bool began = _presenter->BeginFrame(frameTex, frameRtv, drawOffset);
+		if (useStaging) {
+			_frontendLatencyWaitNs.fetch_add(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - waitStart).count(),
+				std::memory_order_relaxed);
+			_frontendRenderCount.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (!began) {
+			return;
+		}
+	}
+
 	d3dDC->ClearState();
 
 	// 所有渲染都使用三角形带拓扑
@@ -310,10 +443,7 @@ void Renderer::_FrontendRender(bool waitForGpu) noexcept {
 		d3dDC->ClearRenderTargetView(frameRtv.get(), BLACK);
 	}
 
-	_lastAccessMutexKey = ++_sharedTextureMutexKey;
-	HRESULT hr = _frontendSharedTextureMutex->AcquireSync(_lastAccessMutexKey - 1, INFINITE);
-	if (FAILED(hr)) {
-		Logger::Get().ComError("AcquireSync 失败", hr);
+	if (!useStaging && !_AcquireFrontendSharedTexture()) {
 		return;
 	}
 
@@ -322,7 +452,7 @@ void Renderer::_FrontendRender(bool waitForGpu) noexcept {
 		frameTex->GetDesc(&desc);
 		if ((LONG)desc.Width == _destRect.right - _destRect.left
 			&& (LONG)desc.Height == _destRect.bottom - _destRect.top) {
-			d3dDC->CopyResource(frameTex.get(), _frontendSharedTexture.get());
+			d3dDC->CopyResource(frameTex.get(), srcTex);
 		} else {
 			d3dDC->CopySubresourceRegion(
 				frameTex.get(),
@@ -330,14 +460,16 @@ void Renderer::_FrontendRender(bool waitForGpu) noexcept {
 				drawOffset.x + _destRect.left - rendererRect.left,
 				drawOffset.y + _destRect.top - rendererRect.top,
 				0,
-				_frontendSharedTexture.get(),
+				srcTex,
 				0,
 				nullptr
 			);
 		}
 	}
 
-	_frontendSharedTextureMutex->ReleaseSync(_lastAccessMutexKey);
+	if (!useStaging) {
+		_ReleaseFrontendSharedTexture();
+	}
 
 	// 叠加层和光标都绘制到 back buffer
 	{
@@ -413,6 +545,8 @@ bool Renderer::OnResize() noexcept {
 		}
 
 		_sharedTextureMutexKey.store(0, std::memory_order_relaxed);
+		_frontendConsumedKey.store(0, std::memory_order_relaxed);
+		_pendingFrontendKey = 0;
 
 		// 渲染完成再通知前端防止黑屏。前端会自动执行渲染，因此无需发送 WM_FRONTEND_RENDER
 		_BackendRender(outputTexture, false);
@@ -429,15 +563,9 @@ bool Renderer::OnResize() noexcept {
 		return false;
 	}
 
-	// 获取共享纹理
-	HRESULT hr = _frontendResources.GetD3DDevice()->OpenSharedResource(
-		sharedTextureHandle, IID_PPV_ARGS(_frontendSharedTexture.put()));
-	if (FAILED(hr)) {
-		Logger::Get().ComError("OpenSharedResource 失败", hr);
+	if (!_OpenFrontendSharedTextures(sharedTextureHandle)) {
 		return false;
 	}
-
-	_frontendSharedTextureMutex = _frontendSharedTexture.try_as<IDXGIKeyedMutex>();
 	// 必须重置 _lastAccessMutexKey，确保不会和 _sharedTextureMutexKey 刚巧相同导致接下来的渲染被跳过
 	_lastAccessMutexKey = 0;
 	_synchronousFramePresentationEnabled.store(true, std::memory_order_release);
@@ -659,7 +787,7 @@ ID3D11Texture2D* Renderer::_BuildEffects() noexcept {
 			dlssFrameGenerationSettings = DLSSFrameGenerationSettings{
 				.multiplier = std::clamp(
 					(uint32_t)std::lround(getParameter("multiplier", 2.0f)),
-					2u, 4u),
+					2u, 6u),
 				.useMotionVectors =
 					getParameter("useMotionVectors", 1.0f) >= 0.5f,
 				.useEstimatedDepth =
@@ -1003,33 +1131,44 @@ HANDLE Renderer::_CreateSharedTexture(ID3D11Texture2D* effectsOutput) noexcept {
 	effectsOutput->GetDesc(&desc);
 	SIZE textureSize = { (LONG)desc.Width, (LONG)desc.Height };
 
-	// 创建共享纹理
-	_backendSharedTexture = DirectXHelper::CreateTexture2D(
-		_backendResources.GetD3DDevice(),
-		DXGI_FORMAT_R8G8B8A8_UNORM,
-		textureSize.cx,
-		textureSize.cy,
-		D3D11_BIND_SHADER_RESOURCE,
-		D3D11_USAGE_DEFAULT,
-		D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
-	);
-	if (!_backendSharedTexture) {
-		Logger::Get().Error("创建 Texture2D 失败");
-		return NULL;
+	auto createOne = [&](winrt::com_ptr<ID3D11Texture2D>& texture,
+		winrt::com_ptr<IDXGIKeyedMutex>& mutex) -> HANDLE {
+		// 创建共享纹理
+		texture = DirectXHelper::CreateTexture2D(
+			_backendResources.GetD3DDevice(),
+			DXGI_FORMAT_R8G8B8A8_UNORM,
+			textureSize.cx,
+			textureSize.cy,
+			D3D11_BIND_SHADER_RESOURCE,
+			D3D11_USAGE_DEFAULT,
+			D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+		);
+		if (!texture) {
+			Logger::Get().Error("创建 Texture2D 失败");
+			return NULL;
+		}
+
+		mutex = texture.try_as<IDXGIKeyedMutex>();
+
+		winrt::com_ptr<IDXGIResource> sharedDxgiRes = texture.try_as<IDXGIResource>();
+
+		HANDLE sharedHandle = NULL;
+		HRESULT hr = sharedDxgiRes->GetSharedHandle(&sharedHandle);
+		if (FAILED(hr)) {
+			Logger::Get().ComError("GetSharedHandle 失败", hr);
+			return NULL;
+		}
+		return sharedHandle;
+	};
+
+	if (_doubleBufferedHandoff) {
+		_sharedTextureHandleAlt = createOne(_backendSharedTextureAlt, _backendSharedTextureMutexAlt);
+		if (!_sharedTextureHandleAlt) {
+			return NULL;
+		}
 	}
 
-	_backendSharedTextureMutex = _backendSharedTexture.try_as<IDXGIKeyedMutex>();
-
-	winrt::com_ptr<IDXGIResource> sharedDxgiRes = _backendSharedTexture.try_as<IDXGIResource>();
-
-	HANDLE sharedHandle = NULL;
-	HRESULT hr = sharedDxgiRes->GetSharedHandle(&sharedHandle);
-	if (FAILED(hr)) {
-		Logger::Get().ComError("GetSharedHandle 失败", hr);
-		return NULL;
-	}
-
-	return sharedHandle;
+	return createOne(_backendSharedTexture, _backendSharedTextureMutex);
 }
 
 void Renderer::_BackendThreadProc() noexcept {
@@ -1063,10 +1202,14 @@ void Renderer::_BackendThreadProc() noexcept {
 	MSG msg;
 	while (true) {
 		bool fpsUpdated = false;
+		const auto idleStart = std::chrono::steady_clock::now();
 		stepTimerStatus = _stepTimer.WaitForNextFrame(
 			waitMsgForNewFrame && stepTimerStatus != StepTimerStatus::WaitForFPSLimiter,
 			fpsUpdated
 		);
+		if (_dlssFrameGenerator) {
+			_dlssFgIdleTime += std::chrono::steady_clock::now() - idleStart;
+		}
 
 		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
 			if (msg.message == WM_QUIT) {
@@ -1083,7 +1226,19 @@ void Renderer::_BackendThreadProc() noexcept {
 			continue;
 		}
 
+		const auto updateStart = std::chrono::steady_clock::now();
+		_BeginDLSSFgGpuTiming();
 		const FrameSourceState frameSourceState = _frameSource->Update();
+		if (_dlssFrameGenerator) {
+			_dlssFgUpdateTime += std::chrono::steady_clock::now() - updateStart;
+		}
+		_MarkDLSSFgGpuTiming(1);
+		const bool willRender = frameSourceState == FrameSourceState::NewFrame ||
+			(frameSourceState == FrameSourceState::Waiting &&
+				stepTimerStatus == StepTimerStatus::ForceNewFrame);
+		if (!willRender) {
+			_EndDLSSFgGpuTiming(false);
+		}
 		switch (frameSourceState) {
 		case FrameSourceState::Waiting:
 			if (stepTimerStatus != StepTimerStatus::ForceNewFrame) {
@@ -1265,6 +1420,11 @@ HANDLE Renderer::_InitBackend() noexcept {
 		return NULL;
 	}
 
+	if (!_frontendConsumedEvent.try_create(wil::EventOptions::None, nullptr)) {
+		Logger::Get().Win32Error("CreateEvent 失败");
+		return NULL;
+	}
+
 	HANDLE sharedHandle = _CreateSharedTexture(outputTexture);
 	if (!sharedHandle) {
 		Logger::Get().Error("_CreateSharedTexture 失败");
@@ -1298,8 +1458,15 @@ void Renderer::_BackendRender(
 				_capturedFrameId, _frameSource->GetOutput(), guidanceRequirements);
 		}
 	}
+	_MarkDLSSFgGpuTiming(2);
 	if (_dlssFrameGenerator) {
 		++_dlssFgCapturedFrameCount;
+		const auto realFrameTime = std::chrono::steady_clock::now();
+		if (_dlssFgLastRealFrame.time_since_epoch().count() != 0) {
+			_dlssFgMaxRealGap = std::max<std::chrono::nanoseconds>(
+				_dlssFgMaxRealGap, realFrameTime - _dlssFgLastRealFrame);
+		}
+		_dlssFgLastRealFrame = realFrameTime;
 	}
 
 	ID3D11DeviceContext4* d3dDC = _backendResources.GetD3DDC();
@@ -1332,8 +1499,10 @@ void Renderer::_BackendRender(
 	}
 
 	_effectsProfiler.OnEndEffects(d3dDC);
+	_MarkDLSSFgGpuTiming(3);
 
 	if (_dlssFrameGenerator) {
+		_dlssFgAcquireStamp = 6;
 		const bool generated = _dlssFrameGenerator->Draw(
 			effectsOutput,
 			_capturedFrameId,
@@ -1341,8 +1510,12 @@ void Renderer::_BackendRender(
 			_frameGuidanceService.ZeroView(),
 			[this](ID3D11Texture2D* generatedFrame) {
 				return _PublishBackendTexture(generatedFrame, true);
+			},
+			[this](uint32_t point) {
+				_MarkDLSSFgGpuTiming(4 + point);
 			}
 		);
+		_dlssFgAcquireStamp = 0;
 		if (!generated) {
 			_HandleDLSSFrameGenerationFailure(effectsOutput);
 		} else {
@@ -1350,14 +1523,171 @@ void Renderer::_BackendRender(
 		}
 	}
 
+	_MarkDLSSFgGpuTiming(7);
+
 	const bool synchronous = _dlssFrameGenerator &&
 		_synchronousFramePresentationEnabled.load(std::memory_order_acquire);
-	if (!_PublishBackendTexture(effectsOutput, synchronous)) {
+	_dlssFgAcquireStamp = 8;
+	const bool published = _PublishBackendTexture(effectsOutput, synchronous);
+	_dlssFgAcquireStamp = 0;
+	if (!published) {
+		_EndDLSSFgGpuTiming(false);
 		return;
 	}
+	_MarkDLSSFgGpuTiming(9);
+	_EndDLSSFgGpuTiming(true);
 
 	// 查询效果的渲染时间
 	_effectsProfiler.QueryTimings(d3dDC);
+}
+
+void Renderer::_BeginDLSSFgGpuTiming() noexcept {
+	_dlssFgGpuSlotOpen = false;
+	if (!_dlssFrameGenerator) {
+		return;
+	}
+
+	ID3D11DeviceContext4* d3dDC = _backendResources.GetD3DDC();
+
+	for (DLSSFgGpuTimingSlot& slot : _dlssFgGpuSlots) {
+		if (!slot.pending) {
+			continue;
+		}
+
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+		if (d3dDC->GetData(slot.disjoint.get(), &disjoint, sizeof(disjoint),
+			D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+			continue;
+		}
+
+		std::array<UINT64, DLSSFG_GPU_STAMPS> stamps{};
+		bool ready = true;
+		for (uint32_t i = 0; i < DLSSFG_GPU_STAMPS; ++i) {
+			if (d3dDC->GetData(slot.stamps[i].get(), &stamps[i], sizeof(UINT64),
+				D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+				ready = false;
+				break;
+			}
+		}
+		if (!ready) {
+			continue;
+		}
+
+		slot.pending = false;
+		if (!slot.valid || disjoint.Disjoint || disjoint.Frequency == 0) {
+			continue;
+		}
+
+		const double toMs = 1000.0 / double(disjoint.Frequency);
+		for (uint32_t i = 1; i < DLSSFG_GPU_STAMPS; ++i) {
+			_dlssFgGpuStageMs[i - 1] += double(stamps[i] - stamps[i - 1]) * toMs;
+		}
+		_dlssFgGpuStageMs[DLSSFG_GPU_STAMPS - 1] +=
+			double(stamps[DLSSFG_GPU_STAMPS - 1] - stamps[0]) * toMs;
+		++_dlssFgGpuSamples;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	if (_dlssFgGpuLogStart.time_since_epoch().count() == 0) {
+		_dlssFgGpuLogStart = now;
+	} else if (now - _dlssFgGpuLogStart >= std::chrono::seconds(1)) {
+		const double elapsed = std::chrono::duration<double>(now - _dlssFgGpuLogStart).count();
+		double evalMs = 0.0;
+		uint32_t evalCount = 0;
+		_dlssFrameGenerator->ConsumeEvalGpuTime(evalMs, evalCount);
+		double evalStartMs = 0.0;
+		double evalDoneMs = 0.0;
+		uint32_t evalLatencyCount = 0;
+		_dlssFrameGenerator->ConsumeEvalLatency(evalStartMs, evalDoneMs, evalLatencyCount);
+		const double latencySamples = std::max<uint32_t>(evalLatencyCount, 1);
+		auto formatStages = [](const std::array<double, DLSSFG_GPU_STAMPS>& ms, uint32_t count) {
+			const double n = std::max<uint32_t>(count, 1);
+			return fmt::format(
+				"update={:.2f} guidance={:.2f} effects={:.2f} fgInput={:.2f} "
+				"fgEvalWait={:.2f} genAcquire={:.2f} genCopy={:.2f} realAcquire={:.2f} "
+				"realCopy={:.2f} span={:.2f}",
+				ms[0] / n, ms[1] / n, ms[2] / n, ms[3] / n, ms[4] / n,
+				ms[5] / n, ms[6] / n, ms[7] / n, ms[8] / n, ms[9] / n);
+		};
+		Logger::Get().Info(fmt::format(
+			"DLSSFG per real frame ms ({} frames, {:.1f}/s): GPU {}; CPU {}; "
+			"DLSSG eval={:.2f}ms each x{:.1f}/s, from submit: d3d12Start={:.2f} d3d12Done={:.2f}",
+			_dlssFgGpuSamples, _dlssFgGpuSamples / elapsed,
+			formatStages(_dlssFgGpuStageMs, _dlssFgGpuSamples),
+			formatStages(_dlssFgCpuStageMs, _dlssFgCpuSamples),
+			evalCount ? evalMs / evalCount : 0.0, evalCount / elapsed,
+			evalStartMs / latencySamples, evalDoneMs / latencySamples));
+		_dlssFgGpuStageMs = {};
+		_dlssFgGpuSamples = 0;
+		_dlssFgCpuStageMs = {};
+		_dlssFgCpuSamples = 0;
+		_dlssFgGpuLogStart = now;
+	}
+
+	DLSSFgGpuTimingSlot& slot = _dlssFgGpuSlots[_dlssFgGpuSlotIdx];
+	if (slot.pending) {
+		return;
+	}
+
+	if (!slot.disjoint) {
+		ID3D11Device5* device = _backendResources.GetD3DDevice();
+		D3D11_QUERY_DESC desc{ .Query = D3D11_QUERY_TIMESTAMP_DISJOINT };
+		if (FAILED(device->CreateQuery(&desc, slot.disjoint.put()))) {
+			return;
+		}
+		desc.Query = D3D11_QUERY_TIMESTAMP;
+		for (auto& stamp : slot.stamps) {
+			if (FAILED(device->CreateQuery(&desc, stamp.put()))) {
+				slot.disjoint = nullptr;
+				return;
+			}
+		}
+	}
+
+	d3dDC->Begin(slot.disjoint.get());
+	d3dDC->End(slot.stamps[0].get());
+	_dlssFgCpuMarks[0] = std::chrono::steady_clock::now();
+	_dlssFgGpuIssued = 1;
+	_dlssFgGpuSlotOpen = true;
+}
+
+void Renderer::_MarkDLSSFgGpuTiming(uint32_t idx) noexcept {
+	if (_dlssFgGpuSlotOpen && !(_dlssFgGpuIssued & (1u << idx))) {
+		_backendResources.GetD3DDC()->End(
+			_dlssFgGpuSlots[_dlssFgGpuSlotIdx].stamps[idx].get());
+		_dlssFgCpuMarks[idx] = std::chrono::steady_clock::now();
+		_dlssFgGpuIssued |= 1u << idx;
+	}
+}
+
+void Renderer::_EndDLSSFgGpuTiming(bool valid) noexcept {
+	if (!_dlssFgGpuSlotOpen) {
+		return;
+	}
+
+	DLSSFgGpuTimingSlot& slot = _dlssFgGpuSlots[_dlssFgGpuSlotIdx];
+	ID3D11DeviceContext4* d3dDC = _backendResources.GetD3DDC();
+	// Every stamp must be issued or GetData never completes for this slot.
+	for (uint32_t i = 1; i < DLSSFG_GPU_STAMPS; ++i) {
+		if (!(_dlssFgGpuIssued & (1u << i))) {
+			d3dDC->End(slot.stamps[i].get());
+			valid = false;
+		}
+	}
+	if (valid) {
+		for (uint32_t i = 1; i < DLSSFG_GPU_STAMPS; ++i) {
+			_dlssFgCpuStageMs[i - 1] += std::chrono::duration<double, std::milli>(
+				_dlssFgCpuMarks[i] - _dlssFgCpuMarks[i - 1]).count();
+		}
+		_dlssFgCpuStageMs[DLSSFG_GPU_STAMPS - 1] += std::chrono::duration<double, std::milli>(
+			_dlssFgCpuMarks[DLSSFG_GPU_STAMPS - 1] - _dlssFgCpuMarks[0]).count();
+		++_dlssFgCpuSamples;
+	}
+	d3dDC->End(slot.disjoint.get());
+	slot.pending = true;
+	slot.valid = valid;
+	_dlssFgGpuSlotIdx = (_dlssFgGpuSlotIdx + 1) % uint32_t(_dlssFgGpuSlots.size());
+	_dlssFgGpuSlotOpen = false;
 }
 
 static float QueryOutputRefreshRate() noexcept {
@@ -1380,13 +1710,13 @@ uint32_t Renderer::_NextDLSSFrameGenerationCount() noexcept {
 	if (_dlssFgGenerated < 0) {
 		_dlssFgRefreshHz = QueryOutputRefreshRate();
 		_dlssFgGenerated = maxGenerated;
-		_dlssFgGeneratedAcc = 0.0;
 		_dlssFgRateWindowStart = now;
 		_dlssFgRateWindowFrames = 0;
 		_frameSource->TakeSourceFrameCounts();
 		Logger::Get().Info(fmt::format(
-			"DLSSFG targeting {} Hz refresh, up to {}x",
-			_dlssFgRefreshHz, _dlssFrameGenerator->Multiplier()));
+			"DLSSFG targeting {} Hz refresh, presenting at {:.0f} Hz, up to {}x",
+			_dlssFgRefreshHz, std::max(double(_dlssFgRefreshHz) - 1.0, 1.0),
+			_dlssFrameGenerator->Multiplier()));
 	} else {
 		++_dlssFgRateWindowFrames;
 	}
@@ -1404,17 +1734,31 @@ uint32_t Renderer::_NextDLSSFrameGenerationCount() noexcept {
 			std::min(double(_dlssFgRateWindowFrames) / counts.checked, 1.0) : 1.0;
 		const double sourceFps = arrived / elapsed * uniqueShare;
 		_dlssFgSourceFps = sourceFps;
-		if (sourceFps > 1.0) {
-			_dlssFgGenerated = std::clamp(
-				_dlssFgRefreshHz / sourceFps - 1.0, 0.0, maxGenerated);
-		}
 		_dlssFgRateWindowStart = now;
 		_dlssFgRateWindowFrames = 0;
 	}
 
-	_dlssFgGeneratedAcc += _dlssFgGenerated;
-	const uint32_t count = (uint32_t)(_dlssFgGeneratedAcc + 1e-6);
-	_dlssFgGeneratedAcc -= count;
+	// Always generate the selected multiplier. Rate estimates lag the game
+	// and let output sag to 220; instead drop only the generated frames that
+	// would exceed refresh-1, using the real time since the last frame.
+	const double presentHz = std::max(double(_dlssFgRefreshHz) - 1.0, 1.0);
+	const double budgetCap = maxGenerated + 2.0;
+	if (_dlssFgBudgetTime.time_since_epoch().count() == 0) {
+		_dlssFgPresentBudget = maxGenerated + 1.0;
+	} else {
+		const double dt = std::chrono::duration<double>(now - _dlssFgBudgetTime).count();
+		_dlssFgPresentBudget = dt > 0.0 && dt < 0.05 ?
+			std::min(_dlssFgPresentBudget + dt * presentHz, budgetCap) :
+			maxGenerated + 1.0;
+	}
+	_dlssFgBudgetTime = now;
+
+	uint32_t count = uint32_t(maxGenerated);
+	while (count > 0 && _dlssFgPresentBudget < double(count) + 1.0) {
+		--count;
+	}
+	_dlssFgPresentBudget -= double(count) + 1.0;
+	_dlssFgGenerated = maxGenerated;
 	return count;
 }
 
@@ -1423,60 +1767,137 @@ bool Renderer::_PublishBackendTexture(
 	bool synchronous
 ) noexcept {
 	ID3D11DeviceContext4* d3dDC = _backendResources.GetD3DDC();
+	HRESULT hr = S_OK;
 
-	HRESULT hr = d3dDC->Signal(_d3dFence.get(), ++_fenceValue);
-	if (FAILED(hr)) {
-		Logger::Get().ComError("Signal 失败", hr);
-		return false;
+	const auto gpuWaitStart = std::chrono::steady_clock::now();
+	// DLSS FG relies on keyed-mutex GPU ordering; a CPU wait here starves the GPU.
+	if (!_dlssFrameGenerator) {
+		hr = d3dDC->Signal(_d3dFence.get(), ++_fenceValue);
+		if (FAILED(hr)) {
+			Logger::Get().ComError("Signal 失败", hr);
+			return false;
+		}
+
+		hr = _d3dFence->SetEventOnCompletion(_fenceValue, _fenceEvent.get());
+		if (FAILED(hr)) {
+			Logger::Get().ComError("SetEventOnCompletion 失败", hr);
+			return false;
+		}
+
+		d3dDC->Flush();
+		_fenceEvent.wait();
+	}
+	const auto frontendWaitStart = std::chrono::steady_clock::now();
+
+	uint64_t key = 0;
+	if (_doubleBufferedHandoff) {
+		key = _sharedTextureMutexKey.load(std::memory_order_relaxed) + 1;
+		// Each slot is reused every second publish.
+		while (key > 2 &&
+			_frontendConsumedKey.load(std::memory_order_acquire) < key - 2 &&
+			_synchronousFramePresentationEnabled.load(std::memory_order_acquire)) {
+			if (WaitForSingleObject(_frontendConsumedEvent.get(), 250) != WAIT_OBJECT_0) {
+				break;
+			}
+		}
+	} else if (_pendingFrontendKey) {
+		// The frontend presents posted frames on its own thread. The shared texture
+		// holds one frame, so the previous one must be copied before overwriting.
+		while (_frontendConsumedKey.load(std::memory_order_acquire) < _pendingFrontendKey &&
+			_synchronousFramePresentationEnabled.load(std::memory_order_acquire)) {
+			if (WaitForSingleObject(_frontendConsumedEvent.get(), 250) != WAIT_OBJECT_0) {
+				break;
+			}
+		}
+		_pendingFrontendKey = 0;
 	}
 
-	hr = _d3dFence->SetEventOnCompletion(_fenceValue, _fenceEvent.get());
-	if (FAILED(hr)) {
-		Logger::Get().ComError("SetEventOnCompletion 失败", hr);
-		return false;
+	if (synchronous) {
+		const auto frontendWaitEnd = std::chrono::steady_clock::now();
+		_dlssFgGpuWait += frontendWaitStart - gpuWaitStart;
+		_dlssFgFrontendWait += frontendWaitEnd - frontendWaitStart;
 	}
 
-	d3dDC->Flush();
-	_fenceEvent.wait();
+	if (_doubleBufferedHandoff) {
+		const bool alt = (key & 1) == 0;
+		IDXGIKeyedMutex* mutex = alt ? _backendSharedTextureMutexAlt.get() : _backendSharedTextureMutex.get();
+		hr = mutex->AcquireSync(0, 100);
+		if (hr == WAIT_TIMEOUT) {
+			// The frontend stopped consuming (resize or hang); drop this frame.
+			Logger::Get().Warn("DLSSFG handoff slot still held by frontend; dropping frame");
+			return true;
+		}
+		if (hr != S_OK) {
+			Logger::Get().ComError("AcquireSync 失败", hr);
+			return false;
+		}
+		if (_dlssFgAcquireStamp) {
+			_MarkDLSSFgGpuTiming(_dlssFgAcquireStamp);
+			_dlssFgAcquireStamp = 0;
+		}
 
-	// 渲染完成后再更新 _sharedTextureMutexKey，否则前端必须等待，降低光标流畅度
-	const uint64_t key = ++_sharedTextureMutexKey;
-	hr = _backendSharedTextureMutex->AcquireSync(key - 1, INFINITE);
-	if (FAILED(hr)) {
-		Logger::Get().ComError("AcquireSync 失败", hr);
-		return false;
+		d3dDC->CopyResource(alt ? _backendSharedTextureAlt.get() : _backendSharedTexture.get(), texture);
+		mutex->ReleaseSync(1);
+		d3dDC->Flush();
+		_sharedTextureMutexKey.store(key, std::memory_order_release);
+	} else {
+		// 渲染完成后再更新 _sharedTextureMutexKey，否则前端必须等待，降低光标流畅度
+		key = ++_sharedTextureMutexKey;
+		hr = _backendSharedTextureMutex->AcquireSync(key - 1, INFINITE);
+		if (FAILED(hr)) {
+			Logger::Get().ComError("AcquireSync 失败", hr);
+			return false;
+		}
+		if (_dlssFgAcquireStamp) {
+			_MarkDLSSFgGpuTiming(_dlssFgAcquireStamp);
+			_dlssFgAcquireStamp = 0;
+		}
+
+		d3dDC->CopyResource(_backendSharedTexture.get(), texture);
+
+		_backendSharedTextureMutex->ReleaseSync(key);
+
+		// 根据 https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-opensharedresource，
+		// 更新共享纹理后必须调用 Flush
+		d3dDC->Flush();
 	}
-
-	d3dDC->CopyResource(_backendSharedTexture.get(), texture);
-
-	_backendSharedTextureMutex->ReleaseSync(key);
-
-	// 根据 https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-opensharedresource，
-	// 更新共享纹理后必须调用 Flush
-	d3dDC->Flush();
 
 	if (synchronous &&
 		_synchronousFramePresentationEnabled.load(std::memory_order_acquire)) {
-		const auto presentStart = std::chrono::steady_clock::now();
-		DWORD_PTR renderResult = 0;
-		if (!SendMessageTimeout(
-			ScalingWindow::Get().Handle(),
-			CommonSharedConstants::WM_FRONTEND_RENDER,
-			1,
-			0,
-			SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
-			250,
-			&renderResult
-		)) {
-			return false;
-		}
-		// Waiting on DWM after every generated frame holds the capture thread
-		// at about one refresh per present, which lands near 30 FPS at 4x.
-		// Only pace when a frame-rate filter is set.
 		if (_synchronousPresentInterval.count() > 0) {
+			const auto presentStart = std::chrono::steady_clock::now();
+			DWORD_PTR renderResult = 0;
+			if (!SendMessageTimeout(
+				ScalingWindow::Get().Handle(),
+				CommonSharedConstants::WM_FRONTEND_RENDER,
+				1,
+				0,
+				SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+				250,
+				&renderResult
+			)) {
+				return false;
+			}
+			// Waiting on DWM after every generated frame holds the capture thread
+			// at about one refresh per present, which lands near 30 FPS at 4x.
+			// Only pace when a frame-rate filter is set.
 			do {
 				Win32Helper::WaitForDwmComposition();
 			} while (std::chrono::steady_clock::now() - presentStart < _synchronousPresentInterval);
+		} else {
+			// Blocking here until the frontend's frame-latency wait returns makes
+			// each real frame fit inside one refresh, which drops real frames at
+			// 120 FPS / 240 Hz. Let the next frame's capture and DLSSG work run
+			// while the frontend waits for scanout.
+			if (!PostMessage(
+				ScalingWindow::Get().Handle(),
+				CommonSharedConstants::WM_FRONTEND_RENDER,
+				1,
+				0
+			)) {
+				return false;
+			}
+			_pendingFrontendKey = key;
 		}
 
 		++_dlssFgPresentedFrameCount;
@@ -1491,16 +1912,36 @@ bool Renderer::_PublishBackendTexture(
 				_overlayFps.store(
 					uint32_t(std::lround(submittedFps)),
 					std::memory_order_relaxed);
+				const double realFrames = std::max<uint32_t>(_dlssFgCapturedFrameCount, 1);
+				const int64_t frontendLatencyNs =
+					_frontendLatencyWaitNs.exchange(0, std::memory_order_relaxed);
+				const uint32_t frontendRenders = std::max<uint32_t>(
+					_frontendRenderCount.exchange(0, std::memory_order_relaxed), 1);
+				using MsF = std::chrono::duration<double, std::milli>;
 				Logger::Get().Info(fmt::format(
 					"DLSSFG presentation: captured={:.1f} FPS, submitted={:.1f} FPS, "
-					"source={:.1f} FPS, target={:.2f}x",
+					"source={:.1f} FPS, target={:.2f}x, per real frame ms: "
+					"update={:.2f} gpuWait={:.2f} frontendWait={:.2f} idle={:.2f} "
+					"maxGap={:.1f}, frontend latencyWait={:.2f}ms x{}",
 					_dlssFgCapturedFrameCount / elapsed,
 					submittedFps,
 					_dlssFgSourceFps,
-					1.0 + std::max(_dlssFgGenerated, 0.0)));
+					1.0 + std::max(_dlssFgGenerated, 0.0),
+					MsF(_dlssFgUpdateTime).count() / realFrames,
+					MsF(_dlssFgGpuWait).count() / realFrames,
+					MsF(_dlssFgFrontendWait).count() / realFrames,
+					MsF(_dlssFgIdleTime).count() / realFrames,
+					MsF(_dlssFgMaxRealGap).count(),
+					frontendLatencyNs / 1e6 / frontendRenders,
+					frontendRenders));
 				_dlssFgDiagnosticsStart = now;
 				_dlssFgCapturedFrameCount = 0;
 				_dlssFgPresentedFrameCount = 0;
+				_dlssFgGpuWait = {};
+				_dlssFgFrontendWait = {};
+				_dlssFgUpdateTime = {};
+				_dlssFgIdleTime = {};
+				_dlssFgMaxRealGap = {};
 			}
 		}
 	}

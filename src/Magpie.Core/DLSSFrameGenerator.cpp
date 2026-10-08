@@ -18,7 +18,22 @@ struct DLSSFrameGenerator::Impl {
 	ID3D11DeviceContext4* context11 = nullptr;
 	winrt::com_ptr<ID3D12Device> device12;
 	winrt::com_ptr<ID3D12CommandQueue> queue12;
-	winrt::com_ptr<ID3D12CommandAllocator> allocator12;
+	static constexpr uint32_t ALLOCATOR_COUNT = 4;
+	std::array<winrt::com_ptr<ID3D12CommandAllocator>, ALLOCATOR_COUNT> allocators12;
+	std::array<uint64_t, ALLOCATOR_COUNT> allocatorFenceValues{};
+	uint32_t nextAllocator = 0;
+	winrt::com_ptr<ID3D12QueryHeap> timestampHeap12;
+	winrt::com_ptr<ID3D12Resource> timestampReadback12;
+	const uint64_t* timestampData = nullptr;
+	uint64_t timestampFrequency = 0;
+	std::array<bool, ALLOCATOR_COUNT> allocatorTimed{};
+	std::array<int64_t, ALLOCATOR_COUNT> allocatorSubmitQpc{};
+	int64_t qpcFrequency = 0;
+	double evalGpuMs = 0.0;
+	double evalStartLatencyMs = 0.0;
+	double evalDoneLatencyMs = 0.0;
+	uint32_t evalGpuSamples = 0;
+	uint32_t evalLatencySamples = 0;
 	winrt::com_ptr<ID3D12GraphicsCommandList> commandList12;
 	winrt::com_ptr<ID3D11Texture2D> sharedInput11;
 	winrt::com_ptr<ID3D11Texture2D> sharedGenerated11;
@@ -200,7 +215,7 @@ bool DLSSFrameGenerator::Initialize(
 	const DLSSFrameGenerationSettings& settings
 ) noexcept {
 	_requestedSettings = settings;
-	_requestedSettings.multiplier = std::clamp(settings.multiplier, 2u, 4u);
+	_requestedSettings.multiplier = std::clamp(settings.multiplier, 2u, 6u);
 	_impl.reset();
 	auto impl = std::make_unique<Impl>();
 	impl->device11 = resources.GetD3DDevice();
@@ -239,19 +254,57 @@ bool DLSSFrameGenerator::Initialize(
 
 	D3D12_COMMAND_QUEUE_DESC queueDesc{};
 	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+	queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
 	hr = impl->device12->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(impl->queue12.put()));
-	if (SUCCEEDED(hr)) {
+	{
+		LARGE_INTEGER frequency;
+		QueryPerformanceFrequency(&frequency);
+		impl->qpcFrequency = frequency.QuadPart;
+	}
+	for (auto& allocator : impl->allocators12) {
+		if (FAILED(hr)) break;
 		hr = impl->device12->CreateCommandAllocator(
-			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(impl->allocator12.put()));
+			D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(allocator.put()));
 	}
 	if (SUCCEEDED(hr)) {
 		hr = impl->device12->CreateCommandList(
-			0, D3D12_COMMAND_LIST_TYPE_DIRECT, impl->allocator12.get(), nullptr,
+			0, D3D12_COMMAND_LIST_TYPE_DIRECT, impl->allocators12[0].get(), nullptr,
 			IID_PPV_ARGS(impl->commandList12.put()));
 	}
 	if (FAILED(hr)) {
 		Logger::Get().ComError("Create DLSSFG D3D12 command objects failed", hr);
 		return false;
+	}
+
+	{
+		D3D12_QUERY_HEAP_DESC heapDesc{
+			.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+			.Count = Impl::ALLOCATOR_COUNT * 2
+		};
+		const D3D12_HEAP_PROPERTIES readbackHeap{ .Type = D3D12_HEAP_TYPE_READBACK };
+		const D3D12_RESOURCE_DESC bufferDesc{
+			.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+			.Width = sizeof(uint64_t) * heapDesc.Count,
+			.Height = 1,
+			.DepthOrArraySize = 1,
+			.MipLevels = 1,
+			.SampleDesc = { 1, 0 },
+			.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+		};
+		void* mapped = nullptr;
+		if (SUCCEEDED(impl->queue12->GetTimestampFrequency(&impl->timestampFrequency)) &&
+			SUCCEEDED(impl->device12->CreateQueryHeap(
+				&heapDesc, IID_PPV_ARGS(impl->timestampHeap12.put()))) &&
+			SUCCEEDED(impl->device12->CreateCommittedResource(
+				&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+				D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+				IID_PPV_ARGS(impl->timestampReadback12.put()))) &&
+			SUCCEEDED(impl->timestampReadback12->Map(0, nullptr, &mapped))) {
+			impl->timestampData = static_cast<const uint64_t*>(mapped);
+		} else {
+			impl->timestampHeap12 = nullptr;
+			impl->timestampReadback12 = nullptr;
+		}
 	}
 
 	if (!CreateSharedTexture(*impl, inputDesc, false,
@@ -331,7 +384,7 @@ bool DLSSFrameGenerator::Initialize(
 		&maxGeneratedFrames))) {
 		maxGeneratedFrames = 1;
 	}
-	maxGeneratedFrames = std::clamp(maxGeneratedFrames, 1u, 3u);
+	maxGeneratedFrames = std::clamp(maxGeneratedFrames, 1u, 5u);
 	impl->multiplier = std::min(
 		_requestedSettings.multiplier, maxGeneratedFrames + 1);
 	if (impl->multiplier != _requestedSettings.multiplier) {
@@ -440,7 +493,8 @@ bool DLSSFrameGenerator::Draw(
 	FrameGuidanceFrameId frameId,
 	const FrameGuidanceView& guidance,
 	const FrameGuidanceView& zeroGuidance,
-	const PublishCallback& publishGeneratedFrame
+	const PublishCallback& publishGeneratedFrame,
+	const TimingCallback& markTiming
 ) noexcept {
 	if (!_impl || !_impl->feature || !_impl->parameters) {
 		return false;
@@ -498,22 +552,77 @@ bool DLSSFrameGenerator::Draw(
 	if (FAILED(hr)) {
 		return false;
 	}
+	if (markTiming) markTiming(0);
 	impl.context11->Flush();
 	hr = impl.queue12->Wait(impl.fence12.get(), inputReady);
 	if (FAILED(hr)) {
 		return false;
 	}
+	LARGE_INTEGER submitQpc;
+	QueryPerformanceCounter(&submitQpc);
 
 	const bool ingestOnly = impl.resetHistory || impl.nextGeneratedFrames == 0;
 	const uint32_t generatedFrameCount =
 		ingestOnly ? 1 : impl.nextGeneratedFrames;
 	for (uint32_t frameIndex = 1; frameIndex <= generatedFrameCount; ++frameIndex) {
-		hr = impl.allocator12->Reset();
+		if (frameIndex > 1) {
+			// The previous generated frame may still be copied out of sharedGenerated.
+			const uint64_t generatedConsumed = ++impl.fenceValue;
+			hr = impl.context11->Signal(impl.fence11.get(), generatedConsumed);
+			if (SUCCEEDED(hr)) {
+				impl.context11->Flush();
+				hr = impl.queue12->Wait(impl.fence12.get(), generatedConsumed);
+			}
+			if (FAILED(hr)) {
+				return false;
+			}
+			QueryPerformanceCounter(&submitQpc);
+		}
+
+		const uint32_t allocatorIdx = impl.nextAllocator;
+		impl.nextAllocator = (allocatorIdx + 1) % Impl::ALLOCATOR_COUNT;
+		if (!WaitForFence(impl, impl.allocatorFenceValues[allocatorIdx])) {
+			return false;
+		}
+		const UINT timestampIdx = allocatorIdx * 2;
+		if (impl.allocatorTimed[allocatorIdx]) {
+			impl.allocatorTimed[allocatorIdx] = false;
+			const uint64_t begin = impl.timestampData[timestampIdx];
+			const uint64_t end = impl.timestampData[timestampIdx + 1];
+			if (end > begin) {
+				impl.evalGpuMs += double(end - begin) * 1000.0 /
+					double(impl.timestampFrequency);
+				++impl.evalGpuSamples;
+
+				UINT64 gpuNow = 0;
+				UINT64 cpuNow = 0;
+				const int64_t submitted = impl.allocatorSubmitQpc[allocatorIdx];
+				if (submitted && impl.qpcFrequency &&
+					SUCCEEDED(impl.queue12->GetClockCalibration(&gpuNow, &cpuNow))) {
+					auto toCpuMs = [&](uint64_t gpuTs) {
+						const double qpc = double(cpuNow) +
+							double(int64_t(gpuTs - gpuNow)) * double(impl.qpcFrequency) /
+							double(impl.timestampFrequency);
+						return (qpc - double(submitted)) * 1000.0 / double(impl.qpcFrequency);
+					};
+					impl.evalStartLatencyMs += toCpuMs(begin);
+					impl.evalDoneLatencyMs += toCpuMs(end);
+					++impl.evalLatencySamples;
+				}
+			}
+		}
+		ID3D12CommandAllocator* allocator = impl.allocators12[allocatorIdx].get();
+		hr = allocator->Reset();
 		if (SUCCEEDED(hr)) {
-			hr = impl.commandList12->Reset(impl.allocator12.get(), nullptr);
+			hr = impl.commandList12->Reset(allocator, nullptr);
 		}
 		if (FAILED(hr)) {
 			return false;
+		}
+		const bool timed = impl.timestampHeap12 && impl.timestampFrequency;
+		if (timed) {
+			impl.commandList12->EndQuery(impl.timestampHeap12.get(),
+				D3D12_QUERY_TYPE_TIMESTAMP, timestampIdx);
 		}
 
 		D3D12_RESOURCE_BARRIER barriers[2]{};
@@ -616,6 +725,13 @@ bool DLSSFrameGenerator::Draw(
 				D3D12_RESOURCE_STATE_COMMON);
 		}
 		impl.commandList12->ResourceBarrier(2, barriers);
+		if (timed) {
+			impl.commandList12->EndQuery(impl.timestampHeap12.get(),
+				D3D12_QUERY_TYPE_TIMESTAMP, timestampIdx + 1);
+			impl.commandList12->ResolveQueryData(impl.timestampHeap12.get(),
+				D3D12_QUERY_TYPE_TIMESTAMP, timestampIdx, 2,
+				impl.timestampReadback12.get(), sizeof(uint64_t) * timestampIdx);
+		}
 		hr = impl.commandList12->Close();
 		if (FAILED(hr)) {
 			return false;
@@ -624,6 +740,11 @@ bool DLSSFrameGenerator::Draw(
 		impl.queue12->ExecuteCommandLists(1, lists);
 		const uint64_t outputReady = ++impl.fenceValue;
 		hr = impl.queue12->Signal(impl.fence12.get(), outputReady);
+		if (SUCCEEDED(hr)) {
+			impl.allocatorFenceValues[allocatorIdx] = outputReady;
+			impl.allocatorTimed[allocatorIdx] = timed;
+			impl.allocatorSubmitQpc[allocatorIdx] = submitQpc.QuadPart;
+		}
 		if (SUCCEEDED(hr) && sharedGuidanceBound) {
 			impl.guidanceInterop->MarkSubmitted(outputReady);
 		}
@@ -633,6 +754,7 @@ bool DLSSFrameGenerator::Draw(
 		if (FAILED(hr)) {
 			return false;
 		}
+		if (frameIndex == 1 && markTiming) markTiming(1);
 		if (!ingestOnly && !publishGeneratedFrame(impl.sharedGenerated11.get())) {
 			return false;
 		}
@@ -647,6 +769,27 @@ bool DLSSFrameGenerator::Draw(
 void DLSSFrameGenerator::RequestHistoryReset() noexcept {
 	if (_impl) {
 		_impl->resetHistory = true;
+	}
+}
+
+void DLSSFrameGenerator::ConsumeEvalGpuTime(double& totalMs, uint32_t& count) noexcept {
+	totalMs = 0.0;
+	count = 0;
+	if (_impl) {
+		std::swap(totalMs, _impl->evalGpuMs);
+		std::swap(count, _impl->evalGpuSamples);
+	}
+}
+
+void DLSSFrameGenerator::ConsumeEvalLatency(
+	double& startMs, double& doneMs, uint32_t& count) noexcept {
+	startMs = 0.0;
+	doneMs = 0.0;
+	count = 0;
+	if (_impl) {
+		std::swap(startMs, _impl->evalStartLatencyMs);
+		std::swap(doneMs, _impl->evalDoneLatencyMs);
+		std::swap(count, _impl->evalLatencySamples);
 	}
 }
 
@@ -672,10 +815,20 @@ bool DLSSFrameGenerator::Resize(
 bool DLSSFrameGenerator::Draw(
 	ID3D11Texture2D*, FrameGuidanceFrameId,
 	const FrameGuidanceView&, const FrameGuidanceView&,
-	const PublishCallback&) noexcept {
+	const PublishCallback&, const TimingCallback&) noexcept {
 	return false;
 }
 void DLSSFrameGenerator::RequestHistoryReset() noexcept {}
+void DLSSFrameGenerator::ConsumeEvalGpuTime(double& totalMs, uint32_t& count) noexcept {
+	totalMs = 0.0;
+	count = 0;
+}
+void DLSSFrameGenerator::ConsumeEvalLatency(
+	double& startMs, double& doneMs, uint32_t& count) noexcept {
+	startMs = 0.0;
+	doneMs = 0.0;
+	count = 0;
+}
 FrameGuidanceRequirements
 DLSSFrameGenerator::GetFrameGuidanceRequirements() const noexcept { return {}; }
 uint32_t DLSSFrameGenerator::Multiplier() const noexcept {
