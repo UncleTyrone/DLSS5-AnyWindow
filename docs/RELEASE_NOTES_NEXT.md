@@ -38,6 +38,14 @@ The pending source release is [DLSS5 AnyWindow 1.9.2 full automatic updates](REL
 - 光标变为可见时不再重置 Frame Guidance 历史，捕获间隔超过 500 ms 时也不再重置。这两种重置会让 DLSS FG 在一帧内绑定零运动并重置历史，造成短暂的鬼影。
 - Frame Guidance history is no longer reset when the cursor becomes visible or after a capture gap longer than 500 ms. Each reset bound zero motion for a frame and reset DLSS FG history, which caused brief bursts of ghosting.
 
+### 编译文档 / Build documentation
+
+- 新增[启用全部可选后端的编译方法](BUILD_ALL_FEATURES.md)：DLSS、DLSSNR、NVIDIA Optical Flow、FSR2、FSR3/FSR4、XeSS SR/FG、RTX Video 和 Depth Anything V2（TensorRT 与 DirectML）的开关、已测试依赖版本、下载来源、目录结构和示例 `BuildOptions.props.user`。
+- 本地编译此前未启用 `EnableDLSSNR`，因此 DLSSNR 日志显示 “support is disabled at build time”。这是本机编译配置问题，并非代码变更导致；新文档说明了所需的 `DLSSNRRuntimeDir`。
+
+- Added [Building with every optional backend](BUILD_ALL_FEATURES.md). It covers the switches, tested dependency versions, download sources, folder layouts, and an example `BuildOptions.props.user` for DLSS, DLSSNR, NVIDIA Optical Flow, FSR2, FSR3/FSR4, XeSS SR/FG, RTX Video, and Depth Anything V2 (TensorRT and DirectML).
+- Local builds without `EnableDLSSNR` log "DLSSNR support is disabled at build time" and pass frames through unchanged. This is a build-configuration issue, not a code regression; the new guide lists the required `DLSSNRRuntimeDir`.
+
 ### 缩放窗口 / Scaling window
 
 - 首次渲染时如果源窗口位置仍在变化，不再立即停止缩放。此前缩放窗口可能在显示前就被关闭。

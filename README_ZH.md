@@ -172,7 +172,7 @@ XeSS 使用跨厂商 D3D12 DP4a 路径，可以在兼容的 Intel、NVIDIA 和 A
 - [NVIDIA Video Effects SDK 示例和安装说明](https://github.com/NVIDIA-Maxine/VFX-SDK-Samples)
 - [NVIDIA `nvidia-vfx` 软件包](https://pypi.org/project/nvidia-vfx/)
 
-如需编译可选后端，请自行新建 `src/BuildOptions.props.user`，并在其中设置功能开关和本机 SDK 路径。该文件已被 `.gitignore` 排除，只用于本机配置，不应提交到公共仓库。
+如需编译可选后端，请自行新建 `src/BuildOptions.props.user`，并在其中设置功能开关和本机 SDK 路径。该文件已被 `.gitignore` 排除，只用于本机配置，不应提交到公共仓库。[启用全部可选后端的编译方法](docs/BUILD_ALL_FEATURES.md)列出了每个开关对应的已测试依赖版本、下载来源、目录结构要求和示例文件。
 
 v1.9.0 任意窗口源码为 RTX 20、RTX 30、RTX 40 和 RTX 50 提供独立的运行库选择分支。外部 RTX 3090 实机已经确认 RTX 30 分支能够启动并产生可见处理效果。控制器提供可以分别修改的滤镜开关快捷键与浮窗隐藏/显示快捷键，支持 `Ctrl+A` 等双键组合，并带有 GitHub 更新检查和项目源码链接的“关于”页。运行库和模型 DLL 仅作为本机构建输入，不包含在本源码树或 GitHub 自动生成的源码归档中。自动更新范围及安全行为见 [v1.9.0 发布说明](docs/RELEASE_NOTES_v1.9.0-auto-update.md)。
 
