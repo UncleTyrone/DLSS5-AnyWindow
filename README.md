@@ -24,7 +24,7 @@ This repository is an independent experimental fork of [Blinue/Magpie](https://g
 The fork owner used OpenAI Codex as a development assistant to add and test experimental captured-frame integrations for:
 
 - NVIDIA DLSS Super Resolution with shared NVIDIA Optical Flow motion and optional estimated depth.
-- NVIDIA DLSS Frame Generation with 2x-6x multipliers, capped at 1 Hz below the display refresh rate, with the same shared guidance.
+- NVIDIA DLSS Frame Generation with 2x-6x multipliers that holds output at the display refresh rate without exceeding it, with the same shared guidance.
 - NVIDIA DLSSNR as a same-resolution SDR AI filter through a locally supplied direct-runtime path.
 - AMD FidelityFX Super Resolution 2.2.1 with zero motion vectors, synthetic jitter metadata, or 50%-resolution colour optical flow.
 - AMD FidelityFX Super Resolution 3.1.5 upscaling (without frame generation) through D3D11/D3D12 interoperability, with zero motion vectors, synthetic jitter metadata, or 50%-resolution colour optical flow.
@@ -84,7 +84,7 @@ While Frame Generation is active, Magpie forces exact duplicate-frame filtering 
 
 | Effect | Hardware and multiplier | Current status |
 | --- | --- | --- |
-| `DLSS FG_Experimental` | NVIDIA RTX; x2-x6, capped at refresh − 1 Hz | Motion defaults on; estimated depth defaults off. Every real frame receives the configured multiplier; generated frames that would exceed refresh − 1 Hz are skipped. x5/x6 require a driver and `nvngx_dlssg.dll` that report support for them, otherwise the multiplier falls back to the reported maximum. Shared D3D11/D3D12 resources use the same captured base-frame ID. Failure protection preserves real frames and disables DLSSFG only for the current scaling session after repeated failures. |
+| `DLSS FG_Experimental` | NVIDIA RTX; x2-x6, held at the refresh rate | Motion defaults on; estimated depth defaults off. Every real frame receives the configured multiplier; generated frames that would push output past the refresh rate are skipped. x5/x6 require a driver and `nvngx_dlssg.dll` that report support for them, otherwise the multiplier falls back to the reported maximum. Shared D3D11/D3D12 resources use the same captured base-frame ID. Failure protection preserves real frames and disables DLSSFG only for the current scaling session after repeated failures. |
 | XeSS Frame Generation x2 Zero-MV | Compatible Intel, NVIDIA, and AMD GPUs; x2 | Experimental cross-vendor path using the XeSS-FG D3D12 proxy swap chain. |
 | XeSS Multi-Frame Generation x2-x4 Zero-MV | Intel Arc; x2/x3/x4 | Experimental Arc multi-frame path. The requested multiplier is clamped to the capability reported by the GPU and driver; non-Arc hardware is limited or falls back to x2. |
 
@@ -94,10 +94,10 @@ These paths can increase displayed frame rate but cannot reconstruct correct obj
 
 `Frame Multiplier` on `DLSS FG_Experimental` (2x-6x) is the number of frames requested for every real frame. Magpie does not lower it based on a measured source frame rate: such estimates lag behind the game, so output sagged whenever the source moved between, say, 110 and 130 FPS.
 
-Instead, output is capped at 1 Hz below the refresh rate of the monitor showing the scaled window (239 FPS on a 240 Hz display). Presenting more frames than the display can show makes real captured frames wait or get dropped, and DLSS then interpolates across larger, uneven gaps, which shows up as ghosting:
+Instead, output is held at the refresh rate of the monitor showing the scaled window and never exceeds it: a 240 Hz display shows a steady 240 FPS. Presenting more frames than the display can show makes real captured frames wait or get dropped, and DLSS then interpolates across larger, uneven gaps, which shows up as ghosting:
 
 - The refresh rate is read when frame generation starts; the cap is never hard-coded.
-- A present credit refills at refresh − 1 per second of real time between captured frames, with about one frame of slack for frame-time jitter.
+- A present credit refills at refresh − 1 per second of real time between captured frames, with about one frame of slack for frame-time jitter. Budgeting 1 Hz under the refresh rate keeps output from overshooting to 241; together with the slack, the measured result is the full refresh rate.
 - Each real frame is always presented. Generated frames are skipped only when presenting them would exceed the credit.
 - A real frame that receives no generated frame is still fed to DLSS, so frame-generation history stays continuous.
 
@@ -105,12 +105,12 @@ Approximate output frame rate:
 
 | Display | Source | 2x | 3x | 4x | 6x |
 | --- | --- | --- | --- | --- | --- |
-| 240 Hz | 120 FPS | 239 | 239 | 239 | 239 |
-| 240 Hz | 105 FPS | 210 | 239 | 239 | 239 |
-| 240 Hz | 60 FPS | 120 | 180 | 239 | 239 |
-| 90 Hz | 60 FPS | 89 | 89 | 89 | 89 |
+| 240 Hz | 120 FPS | 240 | 240 | 240 | 240 |
+| 240 Hz | 105 FPS | 210 | 240 | 240 | 240 |
+| 240 Hz | 60 FPS | 120 | 180 | 240 | 240 |
+| 90 Hz | 60 FPS | 90 | 90 | 90 | 90 |
 
-Choose the lowest multiplier that reaches refresh − 1 at the lowest source frame rate you expect; higher multipliers only add skipped work. There is no switch for this behaviour. The startup log line reports the refresh rate, the present cap, and the multiplier; each per-second `DLSSFG presentation` line reports captured, submitted, and source FPS.
+Choose the lowest multiplier that reaches the refresh rate at the lowest source frame rate you expect; higher multipliers only add skipped work. There is no switch for this behaviour. The startup log line reports the refresh rate, the present cap, and the multiplier; each per-second `DLSSFG presentation` line reports captured, submitted, and source FPS.
 
 Generated frames are presented back-to-back on a FLIP_SEQUENTIAL tearing swap chain with a maximum frame latency of 1; no sleep-based pacing or present queue sits in the frame path. While DLSS FG is active, the backend hands frames to the presenting thread through two alternating keyed-mutex shared textures, so publishing the next frame never waits for the previous one to be copied. NVIDIA Optical Flow uses the FAST preset and, for sources larger than 1280x720, runs at half resolution with the flow scaled back to source pixels; full-resolution MEDIUM flow cost several milliseconds per frame at 1440p and kept DLSS FG below the source frame rate.
 

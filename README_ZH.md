@@ -24,7 +24,7 @@ Magpie 是一个轻量级的窗口超分辨率工具，内置众多高效的算�
 Fork 维护者使用 OpenAI Codex 辅助开发和测试了以下基于捕获帧的实验功能：
 
 - NVIDIA DLSS Super Resolution：复用 NVIDIA Optical Flow 运动信息，并可选使用估算深度。
-- NVIDIA DLSS Frame Generation：支持 x2-x6 倍率，输出上限为显示器刷新率减 1 Hz，并复用同一份 Frame Guidance。
+- NVIDIA DLSS Frame Generation：支持 x2-x6 倍率，输出稳定在显示器刷新率且不会超过，并复用同一份 Frame Guidance。
 - NVIDIA DLSSNR：通过本地提供的直接运行时实现同分辨率 SDR AI 滤镜。
 - AMD FidelityFX Super Resolution 2.2.1：零运动向量、伪 jitter 元数据或 50% 分辨率颜色光流。
 - AMD FidelityFX Super Resolution 3.1.5 上采样（不含帧生成）：通过 D3D11/D3D12 互操作提供零运动向量、伪 jitter 元数据或 50% 分辨率颜色光流模式。
@@ -84,7 +84,7 @@ DLSS FG 位于效果链之后，可复用与 DLSS SR 相同捕获帧的运动信
 
 | Effect | 硬件与倍率 | 当前状态 |
 | --- | --- | --- |
-| `DLSS FG_Experimental` | NVIDIA RTX；x2-x6，上限为刷新率 − 1 Hz | Motion 默认开启，Estimated Depth 默认关闭；每张真实帧都按设置倍率生成，超过刷新率 − 1 Hz 的生成帧会被跳过。x5/x6 需要驱动和 `nvngx_dlssg.dll` 报告支持，否则回退到报告的最高倍率。共享 D3D11/D3D12 资源使用同一捕获基础帧 ID。重复失败时保留真实帧，并只在当前缩放会话禁用 DLSSFG。 |
+| `DLSS FG_Experimental` | NVIDIA RTX；x2-x6，稳定在刷新率 | Motion 默认开启，Estimated Depth 默认关闭；每张真实帧都按设置倍率生成，会使输出超过刷新率的生成帧会被跳过。x5/x6 需要驱动和 `nvngx_dlssg.dll` 报告支持，否则回退到报告的最高倍率。共享 D3D11/D3D12 资源使用同一捕获基础帧 ID。重复失败时保留真实帧，并只在当前缩放会话禁用 DLSSFG。 |
 | XeSS Frame Generation x2 Zero-MV | 兼容的 Intel、NVIDIA 和 AMD GPU；x2 | 使用 XeSS-FG D3D12 代理交换链的通用显卡实验路径。 |
 | XeSS Multi-Frame Generation x2-x4 Zero-MV | Intel Arc；x2/x3/x4 | Arc 多帧生成实验路径。请求倍率会限制在 GPU 和驱动报告的能力范围内；非 Arc 硬件会限制或回退到 x2。 |
 
@@ -94,10 +94,10 @@ DLSS FG 位于效果链之后，可复用与 DLSS SR 相同捕获帧的运动信
 
 `DLSS FG_Experimental` 的 `Frame Multiplier`（2x-6x）是每张真实帧固定请求的倍率。Magpie 不再根据测得的源帧率降低倍率：这类估算总是落后于游戏，源帧率在 110 到 130 FPS 之间波动时输出会明显下滑。
 
-输出改为限制在缩放窗口所在显示器刷新率减 1 Hz（240 Hz 显示器上为 239 FPS）。呈现的帧数超过显示器能显示的数量时，真实捕获帧会排队或被丢弃，DLSS 只能在更大、更不均匀的间隔之间插帧，表现为鬼影：
+输出改为稳定在缩放窗口所在显示器的刷新率且不会超过：240 Hz 显示器上稳定为 240 FPS。呈现的帧数超过显示器能显示的数量时，真实捕获帧会排队或被丢弃，DLSS 只能在更大、更不均匀的间隔之间插帧，表现为鬼影：
 
 - 帧生成启动时读取显示器刷新率；上限不是硬编码的。
-- 呈现额度按真实捕获帧之间经过的时间，以每秒“刷新率 − 1”张的速度补充，并保留约一帧余量以吸收帧时间抖动。
+- 呈现额度按真实捕获帧之间经过的时间，以每秒“刷新率 − 1”张的速度补充，并保留约一帧余量以吸收帧时间抖动。按低于刷新率 1 Hz 分配额度可防止输出冲到 241；加上这一帧余量，实测结果正好是完整刷新率。
 - 真实帧总会呈现；只有超出额度的生成帧才会被跳过。
 - 不生成帧的真实帧仍会送入 DLSS，保持帧生成历史连续。
 
@@ -105,12 +105,12 @@ DLSS FG 位于效果链之后，可复用与 DLSS SR 相同捕获帧的运动信
 
 | 显示器 | 源 | 2x | 3x | 4x | 6x |
 | --- | --- | --- | --- | --- | --- |
-| 240 Hz | 120 FPS | 239 | 239 | 239 | 239 |
-| 240 Hz | 105 FPS | 210 | 239 | 239 | 239 |
-| 240 Hz | 60 FPS | 120 | 180 | 239 | 239 |
-| 90 Hz | 60 FPS | 89 | 89 | 89 | 89 |
+| 240 Hz | 120 FPS | 240 | 240 | 240 | 240 |
+| 240 Hz | 105 FPS | 210 | 240 | 240 | 240 |
+| 240 Hz | 60 FPS | 120 | 180 | 240 | 240 |
+| 90 Hz | 60 FPS | 90 | 90 | 90 | 90 |
 
-请选择在预期最低源帧率下仍能达到“刷新率 − 1”的最低倍率；更高倍率只会增加被跳过的工作。该行为没有开关。启动日志会显示刷新率、呈现上限和倍率；每秒一行的 `DLSSFG presentation` 日志会显示 captured、submitted 和 source 帧率。
+请选择在预期最低源帧率下仍能达到刷新率的最低倍率；更高倍率只会增加被跳过的工作。该行为没有开关。启动日志会显示刷新率、呈现上限和倍率；每秒一行的 `DLSSFG presentation` 日志会显示 captured、submitted 和 source 帧率。
 
 生成帧通过 FLIP_SEQUENTIAL、允许撕裂、最大帧延迟为 1 的交换链连续呈现；帧路径中没有基于 sleep 的节奏控制或呈现队列。DLSS FG 启用时，后端通过两张交替使用的 keyed-mutex 共享纹理把帧交给呈现线程，发布下一帧时无需等待上一帧复制完成。NVIDIA Optical Flow 使用 FAST 预设；源大于 1280x720 时以半分辨率运行，并把光流缩放回源像素。全分辨率 MEDIUM 光流在 1440p 下每帧耗时数毫秒，会使 DLSS FG 低于源帧率。
 
