@@ -29,10 +29,37 @@ private:
 
 	bool _ResizeDCompVisual(HWND hwndAttach = NULL) noexcept;
 
+	bool _IsAttachedOutputHdr(HWND hwnd) noexcept;
+
+	bool _TryCreateDwmSwapChain(HWND hwnd, uint32_t bufferCount, SIZE size) noexcept;
+
+	float _QuerySdrWhiteScale(HWND hwnd) noexcept;
+
+	bool _EnsureHdrBlitPipeline() noexcept;
+
+	bool _EnsureComposeTarget(UINT width, UINT height) noexcept;
+
+	void _BlitSdrToHdr() noexcept;
+
 	winrt::com_ptr<IDXGISwapChain4> _dxgiSwapChain;
 	wil::unique_event_nothrow _frameLatencyWaitableObject;
 	winrt::com_ptr<ID3D11Texture2D> _backBuffer;
 	winrt::com_ptr<ID3D11RenderTargetView> _backBufferRtv;
+
+	// On an HDR monitor the 8-bit image is drawn here, then copied onto a
+	// composition swap chain so DWM does the SDR-to-HDR conversion.
+	winrt::com_ptr<ID3D11Texture2D> _composeTex;
+	winrt::com_ptr<ID3D11RenderTargetView> _composeRtv;
+	winrt::com_ptr<ID3D11ShaderResourceView> _composeSrv;
+	winrt::com_ptr<ID3D11VertexShader> _hdrVs;
+	winrt::com_ptr<ID3D11PixelShader> _hdrPs;
+	winrt::com_ptr<ID3D11Buffer> _hdrCb;
+	winrt::com_ptr<ID3D11RasterizerState> _hdrRasterizer;
+	std::chrono::steady_clock::time_point _sdrWhiteQueryTime{};
+	float _sdrWhiteScale = 1.0f;
+	bool _hdrScanout = false;
+	// Composition swap chain. DWM owns the color conversion; tearing stays off.
+	bool _compositionSwapChain = false;
 
 	// 调整大小或禁用 DirectFlip 时使用
 	winrt::com_ptr<IDCompositionDesktopDevice> _dcompDevice;

@@ -173,6 +173,11 @@ private:
 	double _dlssFgSourceFps = 0.0;
 	// Generated frames requested per real frame; -1 until initialized.
 	double _dlssFgGenerated = -1.0;
+	bool _dlssFgDynamic = false;
+	float _dlssFgDynamicTarget = 0.0f;
+	double _dlssFgDynamicEma = 0.0;
+	uint32_t _dlssFgDynamicCount = 0;
+	std::chrono::steady_clock::time_point _dlssFgDynamicStep{};
 	// Frames of present credit, refilled at refresh-1 Hz.
 	double _dlssFgPresentBudget = 2.0;
 	std::chrono::steady_clock::time_point _dlssFgBudgetTime{};

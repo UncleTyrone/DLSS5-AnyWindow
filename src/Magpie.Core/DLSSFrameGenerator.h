@@ -9,6 +9,9 @@ struct DLSSFrameGenerationSettings {
 	uint32_t multiplier = 2;
 	bool useMotionVectors = true;
 	bool useEstimatedDepth = false;
+	// 0 retargets Blackwell PTX to Ada. 1 is the midpoint path (gates only
+	// until the PTX redirect is applied). Ignored on non-Ada GPUs.
+	uint32_t adaTemporalFix = 0;
 };
 
 // Experimental DLSS Frame Generation adapter. It consumes final effect-chain

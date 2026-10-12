@@ -1,0 +1,3 @@
+The ViT bottleneck decision in src/Magpie.Core/DLSSNRVitReuse.h is adapted from
+janblade/OptiScaler-F5-DLSSNR-Multipass, OptiScaler/dlssnr/DlssNrVitReuse.h,
+which is licensed under GPL-3.0-or-later. This project is also GPL-3.0.

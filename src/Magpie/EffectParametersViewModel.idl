@@ -3,6 +3,7 @@ namespace Magpie {
 		Boolean Value;
 		// Bind to CheckBox.Content
 		Object Label { get; };
+		Boolean IsEnabled { get; };
 	}
 
 	runtimeclass ScalingModeFloatParameter : Windows.UI.Xaml.Data.INotifyPropertyChanged {
@@ -12,6 +13,8 @@ namespace Magpie {
 		Double Minimum { get; };
 		Double Maximum { get; };
 		Double Step { get; };
+		Boolean IsEnabled { get; };
+		Double Opacity { get; };
 	}
 
 	runtimeclass EffectParametersViewModel {
@@ -20,7 +23,20 @@ namespace Magpie {
 
 		IVector<IInspectable> BoolParams { get; };
 		IVector<IInspectable> FloatParams { get; };
+		IVector<IInspectable> FilterBoolParams { get; };
+		IVector<IInspectable> FilterFloatParams { get; };
+		IVector<IInspectable> Pass1Params { get; };
+		IVector<IInspectable> Pass2Params { get; };
+		IVector<IInspectable> Pass3Params { get; };
+		IVector<IInspectable> Pass4Params { get; };
+		IVector<IInspectable> GuidanceParams { get; };
 		Boolean HasBoolParams { get; };
 		Boolean HasFloatParams { get; };
+		Boolean HasFilterParams { get; };
+		Boolean HasPass1Params { get; };
+		Boolean HasPass2Params { get; };
+		Boolean HasPass3Params { get; };
+		Boolean HasPass4Params { get; };
+		Boolean HasGuidanceParams { get; };
 	}
 }

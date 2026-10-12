@@ -88,6 +88,7 @@
     <ClInclude Include="YasHelper.h" />
     <ClInclude Include="DLSSZeroMVUpscaler.h" />
     <ClInclude Include="DLSSFrameGenerator.h" />
+    <ClInclude Include="DLSSGAdaUnlock.h" />
     <ClInclude Include="DLSSNRFilter.h" />
     <ClInclude Include="FrameGuidanceProvider.h" />
     <ClInclude Include="FrameGuidanceService.h" />
@@ -149,7 +150,14 @@
     <ClCompile Include="WindowHelper.cpp" />
     <ClCompile Include="DLSSZeroMVUpscaler.cpp" />
     <ClCompile Include="DLSSFrameGenerator.cpp" />
+    <ClCompile Include="DLSSGAdaUnlock.cpp" />
+    <ClCompile Include="DLSSGMidpoint.cpp" />
+    <ClCompile Include="DLSSGWarpBlend.cpp" />
     <ClCompile Include="DLSSNRFilter.cpp" />
+    <ClCompile Include="DLSSNRNvapi.cpp" />
+    <ClCompile Include="DLSSNRHybrid.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="FrameGuidanceService.cpp" />
     <ClCompile Include="ZeroFrameGuidanceProvider.cpp" />
     <ClCompile Include="NvidiaOpticalFlowProvider.cpp" />

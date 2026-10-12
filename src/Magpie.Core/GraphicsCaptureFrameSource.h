@@ -38,7 +38,23 @@ private:
 
 	bool _TryCreateGraphicsCaptureItem(IGraphicsCaptureItemInterop* interop) noexcept;
 
+	bool _EnsureScRgbConversion() noexcept;
+
+	void _ConvertScRgbToSrgb(ID3D11Texture2D* source) noexcept;
+
 	D3D11_BOX _frameBox{};
+
+	// HDR desktops compose SDR windows as scRGB. An 8-bit capture clamps that
+	// and the grays come back lifted. Float capture keeps the values so they
+	// can be turned back into sRGB.
+	winrt::com_ptr<ID3D11RenderTargetView> _outputRtv;
+	winrt::com_ptr<ID3D11VertexShader> _scRgbVs;
+	winrt::com_ptr<ID3D11PixelShader> _scRgbPs;
+	winrt::com_ptr<ID3D11Buffer> _scRgbCb;
+	winrt::com_ptr<ID3D11RasterizerState> _scRgbRasterizer;
+	std::chrono::steady_clock::time_point _sdrWhiteQueryTime{};
+	float _invSdrWhiteScale = 1.0f;
+	bool _hdrScRgbCapture = false;
 
 	winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice _wrappedD3DDevice{ nullptr };
 	winrt::Windows::Graphics::Capture::GraphicsCaptureItem _captureItem{ nullptr };

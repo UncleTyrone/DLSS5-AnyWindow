@@ -71,11 +71,15 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 					getParameter("processingResolutionPercent", 100.0f))), 25, 100)),
 			.style = std::clamp(
 				static_cast<int>(std::lround(getParameter("style", 0.0f))), 0, 2),
-			.intensity = std::clamp(getParameter("intensity", 1.0f), 0.0f, 1.0f),
+			.intensity = std::clamp(getParameter("intensity", 1.0f), 0.0f, 2.0f),
 			.localToneStrength = std::clamp(
-				getParameter("localToneStrength", 1.0f), 0.0f, 1.0f),
+				getParameter("localToneStrength", 1.0f), 0.0f, 2.0f),
 			.localStructureStrength = std::clamp(
-				getParameter("localStructureStrength", 1.0f), 0.0f, 1.0f),
+				getParameter("localStructureStrength", 1.0f), 0.0f, 2.0f),
+			.skinStructureStrength = std::clamp(
+				getParameter("skinStructureStrength", -1.0f), -1.0f, 2.0f),
+			.renderPreset = std::clamp(static_cast<int>(std::lround(
+				getParameter("renderPreset", 0.0f))), 0, 3),
 			.useAutoMask = getParameter("useAutoMask", 0.0f) >= 0.5f,
 			.guidanceMode = std::clamp(
 				static_cast<int>(std::lround(
@@ -87,8 +91,34 @@ NativeEffectBackendResult CreateNativeEffectBackend(
 				static_cast<int>(std::lround(getParameter("passes", 1.0f))), 1, 4)),
 			.historyMode = std::clamp(static_cast<int>(std::lround(getParameter(
 				"historyMode",
-				getParameter("antiFlicker", 0.0f) >= 0.5f ? 1.0f : 2.0f))), 0, 2)
+				getParameter("antiFlicker", 0.0f) >= 0.5f ? 1.0f : 0.0f))), 0, 2)
 		};
+		settings.passFeedback = std::clamp(getParameter("passFeedback", 1.0f), 0.0f, 1.0f);
+		settings.detailReuse = getParameter("detailReuse", 0.0f) >= 0.5f;
+		settings.vitReuseInterval = static_cast<uint32_t>(std::clamp(
+			static_cast<int>(std::lround(getParameter("vitReuseInterval", 1.0f))), 1, 2));
+		settings.modelPrecision = std::clamp(static_cast<int>(std::lround(
+			getParameter("modelPrecision", 0.0f))), 0, 1);
+		auto tune = [&](DLSSNRSettings::PassTune& pass, const char* prefix,
+			float defaultTone) {
+			auto name = [&](const char* suffix) {
+				return std::string(prefix) + suffix;
+			};
+			pass.style = std::clamp(static_cast<int>(std::lround(
+				getParameter(name("Style"), -1.0f))), -1, 2);
+			pass.intensity = std::clamp(getParameter(name("Intensity"), -1.0f), -1.0f, 2.0f);
+			pass.localToneStrength = std::clamp(
+				getParameter(name("LocalTone"), defaultTone), -1.0f, 2.0f);
+			pass.localStructureStrength = std::clamp(
+				getParameter(name("LocalStructure"), -1.0f), -1.0f, 2.0f);
+			pass.skinStructureStrength = std::clamp(
+				getParameter(name("Skin"), -1.0f), -1.0f, 2.0f);
+			pass.renderPreset = std::clamp(static_cast<int>(std::lround(
+				getParameter(name("Preset"), -1.0f))), -1, 3);
+		};
+		tune(settings.laterPass[0], "pass2", 0.0f);
+		tune(settings.laterPass[1], "pass3", 0.0f);
+		tune(settings.laterPass[2], "pass4", 0.0f);
 		auto backend = std::make_unique<DLSSNRFilter>();
 		if (!backend->Initialize(resources, input, output, settings)) {
 			const char status[] =

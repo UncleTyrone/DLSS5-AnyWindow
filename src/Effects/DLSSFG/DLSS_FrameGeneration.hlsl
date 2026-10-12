@@ -14,6 +14,30 @@
 float multiplier;
 
 //!PARAMETER
+//!LABEL Dynamic Frame Generation
+//!DEFAULT 0
+//!MIN 0
+//!MAX 1
+//!STEP 1
+float dynamicMfg;
+
+//!PARAMETER
+//!LABEL Dynamic Target FPS
+//!DEFAULT 0
+//!MIN 0
+//!MAX 1000
+//!STEP 1
+float dynamicTargetFps;
+
+//!PARAMETER
+//!LABEL Ada Temporal Fix
+//!DEFAULT 0
+//!MIN 0
+//!MAX 1
+//!STEP 1
+float adaTemporalFix;
+
+//!PARAMETER
 //!LABEL Use Motion Vectors
 //!DEFAULT 1
 //!MIN 0

@@ -7,9 +7,37 @@
       xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
       mc:Ignorable="d">
 	<Page.Resources>
+		<DataTemplate x:Key="FloatParameterItem"
+		              x:DataType="local:ScalingModeFloatParameter">
+			<local:SimpleStackPanel Spacing="8">
+				<Grid>
+					<Grid.ColumnDefinitions>
+						<ColumnDefinition Width="*" />
+						<ColumnDefinition Width="Auto" />
+					</Grid.ColumnDefinitions>
+					<TextBlock Grid.Column="0"
+					           VerticalAlignment="Center"
+					           Opacity="{x:Bind Opacity, Mode=OneWay}"
+					           Text="{x:Bind Label, Mode=OneTime}"
+					           TextWrapping="WrapWholeWords" />
+					<TextBlock Grid.Column="1"
+					           Margin="12,0,0,0"
+					           VerticalAlignment="Center"
+					           Opacity="{x:Bind Opacity, Mode=OneWay}"
+					           Text="{x:Bind ValueText, Mode=OneWay}" />
+				</Grid>
+				<Slider HorizontalAlignment="Stretch"
+				        IsEnabled="{x:Bind IsEnabled, Mode=OneWay}"
+				        IsThumbToolTipEnabled="False"
+				        Maximum="{x:Bind Maximum, Mode=OneWay}"
+				        Minimum="{x:Bind Minimum, Mode=OneTime}"
+				        StepFrequency="{x:Bind Step, Mode=OneTime}"
+				        Value="{x:Bind Value, Mode=TwoWay}" />
+			</local:SimpleStackPanel>
+		</DataTemplate>
 		<DataTemplate x:Key="EffectParametersFlyout"
 		              x:DataType="local:EffectParametersViewModel">
-			<local:SimpleStackPanel Margin="0,0,0,-17">
+			<local:SimpleStackPanel Width="300">
 				<ItemsControl x:Name="BoolParamsListView"
 				              MaxWidth="260"
 				              Margin="0,0,0,15"
@@ -20,7 +48,8 @@
 						<DataTemplate x:DataType="local:ScalingModeBoolParameter">
 							<CheckBox MinWidth="0"
 							          Content="{x:Bind Label, Mode=OneTime}"
-							          IsChecked="{x:Bind Value, Mode=TwoWay}" />
+							          IsChecked="{x:Bind Value, Mode=TwoWay}"
+							          IsEnabled="{x:Bind IsEnabled, Mode=OneWay}" />
 						</DataTemplate>
 					</ItemsControl.ItemTemplate>
 				</ItemsControl>
@@ -36,32 +65,155 @@
 						</ItemsPanelTemplate>
 					</ItemsControl.ItemsPanel>
 					<ItemsControl.ItemTemplate>
-						<DataTemplate x:DataType="local:ScalingModeFloatParameter">
-							<local:SimpleStackPanel>
-								<Grid ColumnSpacing="4">
-									<Grid.ColumnDefinitions>
-										<ColumnDefinition Width="*" />
-										<ColumnDefinition Width="60" />
-									</Grid.ColumnDefinitions>
-									<TextBlock Grid.Column="0"
-									           VerticalAlignment="Center"
-									           Text="{x:Bind Label, Mode=OneTime}"
-									           TextWrapping="WrapWholeWords" />
-									<TextBlock Grid.Column="1"
-									           HorizontalAlignment="Right"
-									           VerticalAlignment="Center"
-									           Text="{x:Bind ValueText, Mode=OneWay}" />
-								</Grid>
-								<Slider HorizontalAlignment="Stretch"
-								        IsThumbToolTipEnabled="False"
-								        Maximum="{x:Bind Maximum, Mode=OneTime}"
-								        Minimum="{x:Bind Minimum, Mode=OneTime}"
-								        StepFrequency="{x:Bind Step, Mode=OneTime}"
-								        Value="{x:Bind Value, Mode=TwoWay}" />
-							</local:SimpleStackPanel>
-						</DataTemplate>
+						<StaticResource ResourceKey="FloatParameterItem" />
 					</ItemsControl.ItemTemplate>
 				</ItemsControl>
+				<muxc:Expander x:Name="FilterExpander"
+				               Margin="0,0,0,8"
+				               Padding="16,12,16,8"
+				               HorizontalAlignment="Stretch"
+				               HorizontalContentAlignment="Stretch"
+				               x:Load="{x:Bind HasFilterParams, Mode=OneTime}"
+				               IsExpanded="False">
+					<muxc:Expander.Header>
+						<TextBlock Text="Filter" />
+					</muxc:Expander.Header>
+					<local:SimpleStackPanel Margin="0,12,0,4" Spacing="16">
+						<ItemsControl HorizontalAlignment="Stretch"
+						              IsTabStop="False"
+						              ItemTemplate="{StaticResource FloatParameterItem}"
+						              ItemsSource="{x:Bind FilterFloatParams, Mode=OneTime}">
+							<ItemsControl.ItemsPanel>
+								<ItemsPanelTemplate>
+									<local:SimpleStackPanel Spacing="8" />
+								</ItemsPanelTemplate>
+							</ItemsControl.ItemsPanel>
+						</ItemsControl>
+						<ItemsControl x:Name="FilterBoolList"
+						              HorizontalAlignment="Stretch"
+						              IsTabStop="False"
+						              ItemsSource="{x:Bind FilterBoolParams, Mode=OneTime}">
+							<ItemsControl.ItemTemplate>
+								<DataTemplate x:DataType="local:ScalingModeBoolParameter">
+									<CheckBox MinWidth="0"
+									          Content="{x:Bind Label, Mode=OneTime}"
+									          IsChecked="{x:Bind Value, Mode=TwoWay}"
+									          IsEnabled="{x:Bind IsEnabled, Mode=OneWay}" />
+								</DataTemplate>
+							</ItemsControl.ItemTemplate>
+						</ItemsControl>
+					</local:SimpleStackPanel>
+				</muxc:Expander>
+				<muxc:Expander x:Name="Pass1Expander"
+				               Margin="0,0,0,8"
+				               Padding="16,12,16,8"
+				               HorizontalAlignment="Stretch"
+				               HorizontalContentAlignment="Stretch"
+				               x:Load="{x:Bind HasPass1Params, Mode=OneTime}"
+				               IsExpanded="False">
+					<muxc:Expander.Header>
+						<TextBlock Text="Pass 1" />
+					</muxc:Expander.Header>
+					<ItemsControl HorizontalAlignment="Stretch"
+					              Margin="0,8,0,0"
+					              IsTabStop="False"
+					              ItemTemplate="{StaticResource FloatParameterItem}"
+					              ItemsSource="{x:Bind Pass1Params, Mode=OneTime}">
+						<ItemsControl.ItemsPanel>
+							<ItemsPanelTemplate>
+								<local:SimpleStackPanel Spacing="16" />
+							</ItemsPanelTemplate>
+						</ItemsControl.ItemsPanel>
+					</ItemsControl>
+				</muxc:Expander>
+				<muxc:Expander x:Name="Pass2Expander"
+				               Margin="0,4,0,8"
+				               Padding="16,12,16,8"
+				               HorizontalAlignment="Stretch"
+				               HorizontalContentAlignment="Stretch"
+				               x:Load="{x:Bind HasPass2Params, Mode=OneTime}"
+				               IsExpanded="False">
+					<muxc:Expander.Header>
+						<TextBlock Text="Pass 2" />
+					</muxc:Expander.Header>
+					<ItemsControl HorizontalAlignment="Stretch"
+					              Margin="0,8,0,0"
+					              IsTabStop="False"
+					              ItemTemplate="{StaticResource FloatParameterItem}"
+					              ItemsSource="{x:Bind Pass2Params, Mode=OneTime}">
+						<ItemsControl.ItemsPanel>
+							<ItemsPanelTemplate>
+								<local:SimpleStackPanel Spacing="16" />
+							</ItemsPanelTemplate>
+						</ItemsControl.ItemsPanel>
+					</ItemsControl>
+				</muxc:Expander>
+				<muxc:Expander x:Name="Pass3Expander"
+				               Margin="0,0,0,8"
+				               Padding="16,12,16,8"
+				               HorizontalAlignment="Stretch"
+				               HorizontalContentAlignment="Stretch"
+				               x:Load="{x:Bind HasPass3Params, Mode=OneTime}"
+				               IsExpanded="False">
+					<muxc:Expander.Header>
+						<TextBlock Text="Pass 3" />
+					</muxc:Expander.Header>
+					<ItemsControl HorizontalAlignment="Stretch"
+					              Margin="0,8,0,0"
+					              IsTabStop="False"
+					              ItemTemplate="{StaticResource FloatParameterItem}"
+					              ItemsSource="{x:Bind Pass3Params, Mode=OneTime}">
+						<ItemsControl.ItemsPanel>
+							<ItemsPanelTemplate>
+								<local:SimpleStackPanel Spacing="16" />
+							</ItemsPanelTemplate>
+						</ItemsControl.ItemsPanel>
+					</ItemsControl>
+				</muxc:Expander>
+				<muxc:Expander x:Name="Pass4Expander"
+				               Margin="0,0,0,8"
+				               Padding="16,12,16,8"
+				               HorizontalAlignment="Stretch"
+				               HorizontalContentAlignment="Stretch"
+				               x:Load="{x:Bind HasPass4Params, Mode=OneTime}"
+				               IsExpanded="False">
+					<muxc:Expander.Header>
+						<TextBlock Text="Pass 4" />
+					</muxc:Expander.Header>
+					<ItemsControl HorizontalAlignment="Stretch"
+					              Margin="0,8,0,0"
+					              IsTabStop="False"
+					              ItemTemplate="{StaticResource FloatParameterItem}"
+					              ItemsSource="{x:Bind Pass4Params, Mode=OneTime}">
+						<ItemsControl.ItemsPanel>
+							<ItemsPanelTemplate>
+								<local:SimpleStackPanel Spacing="16" />
+							</ItemsPanelTemplate>
+						</ItemsControl.ItemsPanel>
+					</ItemsControl>
+				</muxc:Expander>
+				<muxc:Expander x:Name="GuidanceExpander"
+				               Margin="0,0,0,12"
+				               Padding="16,12,16,8"
+				               HorizontalAlignment="Stretch"
+				               HorizontalContentAlignment="Stretch"
+				               x:Load="{x:Bind HasGuidanceParams, Mode=OneTime}"
+				               IsExpanded="False">
+					<muxc:Expander.Header>
+						<TextBlock Text="Guidance" />
+					</muxc:Expander.Header>
+					<ItemsControl HorizontalAlignment="Stretch"
+					              Margin="0,8,0,0"
+					              IsTabStop="False"
+					              ItemTemplate="{StaticResource FloatParameterItem}"
+					              ItemsSource="{x:Bind GuidanceParams, Mode=OneTime}">
+						<ItemsControl.ItemsPanel>
+							<ItemsPanelTemplate>
+								<local:SimpleStackPanel Spacing="16" />
+							</ItemsPanelTemplate>
+						</ItemsControl.ItemsPanel>
+					</ItemsControl>
+				</muxc:Expander>
 			</local:SimpleStackPanel>
 		</DataTemplate>
 	</Page.Resources>
@@ -413,7 +565,9 @@
 																<Flyout.FlyoutPresenterStyle>
 																	<Style BasedOn="{StaticResource DefaultFlyoutPresenterStyle}"
 																	       TargetType="FlyoutPresenter">
-																		<Setter Property="MaxHeight" Value="450" />
+																		<Setter Property="MinWidth" Value="332" />
+																		<Setter Property="MaxWidth" Value="332" />
+																		<Setter Property="MaxHeight" Value="680" />
 																	</Style>
 																</Flyout.FlyoutPresenterStyle>
 																<ContentControl Content="{x:Bind Parameters, Mode=OneTime}"

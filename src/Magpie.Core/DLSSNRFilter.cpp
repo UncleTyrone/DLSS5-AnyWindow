@@ -7,6 +7,7 @@
 #include "Win32Helper.h"
 #include "FrameGuidanceD3D12Interop.h"
 #include "FrameGuidancePerformance.h"
+#include "DLSSNRNvapi.h"
 
 #include <atomic>
 
@@ -138,6 +139,208 @@ void ConvertToRgba(uint3 tid : SV_DispatchThreadID) {
     OutputColor.GetDimensions(width, height);
     if (tid.x >= width || tid.y >= height) return;
     OutputColor[tid.xy] = InputColor.Load(int3(tid.xy, 0));
+}
+)";
+
+constexpr char PASS_FEEDBACK_HLSL[] = R"(
+Texture2D<float4> ProxyColor : register(t0);
+Texture2D<float4> AnswerColor : register(t1);
+RWTexture2D<float4> OutputColor : register(u0);
+
+cbuffer Feedback : register(b0) {
+    float FeedbackAmount;
+    float3 FeedbackPad;
+};
+
+[numthreads(8, 8, 1)]
+void BlendPassFeedback(uint3 tid : SV_DispatchThreadID) {
+    uint width, height;
+    OutputColor.GetDimensions(width, height);
+    if (tid.x >= width || tid.y >= height) return;
+    float3 proxy = ProxyColor.Load(int3(tid.xy, 0)).rgb;
+    float3 answer = AnswerColor.Load(int3(tid.xy, 0)).rgb;
+    OutputColor[tid.xy] = float4(lerp(proxy, answer, FeedbackAmount), 1);
+}
+)";
+
+// Janblade detail reuse without a depth guide (dlssnr_detail_reuse.hlsl, HasDepth == false).
+// Detail is answer - input. The next frame adds the moved detail times a soft trust from the
+// colour box and the motion test. Fill then borrows trusted neighbours so a rejected pixel does
+// not flash back to the raw picture. An exact match rejects capture noise and is what flickers.
+constexpr char DETAIL_REPROJECT_HLSL[] = R"(
+cbuffer Params : register(b0) {
+    uint mode;
+    uint workWidth;
+    uint workHeight;
+    float clipGamma;
+    float clipFalloff;
+    float sigmaFloor;
+    float motionReject;
+    float fillStrength;
+    float fillRadius;
+    float pad0;
+    float pad1;
+    float pad2;
+};
+
+Texture2D<float4> t0 : register(t0);
+Texture2D<float4> t1 : register(t1);
+Texture2D<float4> t2 : register(t2);
+Texture2D<float2> t3 : register(t3);
+SamplerState gLinear : register(s0);
+RWTexture2D<float4> u0 : register(u0);
+RWTexture2D<float4> u1 : register(u1);
+
+float2 WorkSize() { return float2(workWidth, workHeight); }
+
+float3 ToYCoCg(float3 c) {
+    return float3(
+        dot(c, float3(0.25, 0.5, 0.25)),
+        dot(c, float3(0.5, 0.0, -0.5)),
+        dot(c, float3(-0.25, 0.5, -0.25)));
+}
+
+void ColourBox(uint2 p, out float3 mean, out float3 sigma) {
+    const int2 last = int2(WorkSize()) - 1;
+    float3 sum = 0.0, sumSquares = 0.0;
+    [unroll] for (int cy = -1; cy <= 1; ++cy) {
+        [unroll] for (int cx = -1; cx <= 1; ++cx) {
+            const float3 c = ToYCoCg(t0.Load(int3(clamp(int2(p) + int2(cx, cy), int2(0, 0), last), 0)).rgb);
+            sum += c;
+            sumSquares += c * c;
+        }
+    }
+    mean = sum / 9.0;
+    sigma = max(sqrt(max(sumSquares / 9.0 - mean * mean, 0.0)), max(sigmaFloor, 1e-5));
+}
+
+float2 MotionAt(int2 p) {
+    const int2 last = int2(WorkSize()) - 1;
+    return t3.Load(int3(clamp(p, int2(0, 0), last), 0));
+}
+
+float MotionTrust(float2 previousUv, float2 herePixels) {
+    if (motionReject <= 0.0) return 1.0;
+    const int2 therePx = int2(previousUv * WorkSize());
+    const float2 therePixels = MotionAt(therePx);
+    const float difference = length(herePixels - therePixels);
+    if (!isfinite(difference)) return 1.0;
+    return 1.0 - smoothstep(0.5, 1.0, difference / (motionReject * (length(herePixels) + 1.0)));
+}
+
+float4 SampleCatmullRom(Texture2D<float4> tex, float2 uv, float2 size) {
+    const float2 position = uv * size;
+    const float2 centre = floor(position - 0.5) + 0.5;
+    const float2 f = position - centre;
+    const float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const float2 w3 = f * f * (-0.5 + 0.5 * f);
+    const float2 w12 = w1 + w2;
+    const float2 texel = 1.0 / size;
+    const float2 uv0 = (centre - 1.0) * texel;
+    const float2 uv3 = (centre + 2.0) * texel;
+    const float2 uv12 = (centre + w2 / max(w12, 1e-4)) * texel;
+    float4 result = tex.SampleLevel(gLinear, float2(uv12.x, uv0.y), 0) * (w12.x * w0.y);
+    result += tex.SampleLevel(gLinear, float2(uv0.x, uv12.y), 0) * (w0.x * w12.y);
+    result += tex.SampleLevel(gLinear, uv12, 0) * (w12.x * w12.y);
+    result += tex.SampleLevel(gLinear, float2(uv3.x, uv12.y), 0) * (w3.x * w12.y);
+    result += tex.SampleLevel(gLinear, float2(uv12.x, uv3.y), 0) * (w12.x * w3.y);
+    const float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return result / max(weight, 1e-4);
+}
+
+float4 MovedDetail(uint2 p) {
+    const float2 work = WorkSize();
+    const float2 uv = (float2(p) + 0.5) / work;
+    const float2 raw = MotionAt(int2(p));
+    const float2 previousUv = uv + raw / work;
+    if (!all(isfinite(previousUv)) || any(previousUv < 0.0) || any(previousUv > 1.0))
+        return 0.0;
+
+    float3 mean, sigma;
+    ColourBox(p, mean, sigma);
+
+    const float2 position = previousUv * work - 0.5;
+    const int2 base = int2(floor(position));
+    const float2 f = position - float2(base);
+    float3 detailLo = 65504.0, detailHi = -65504.0;
+    float valid = 1.0;
+    [unroll] for (int i = 0; i < 4; ++i) {
+        const int2 corner = int2(i & 1, i >> 1);
+        const float2 axis = float2(corner.x != 0 ? f.x : 1.0 - f.x, corner.y != 0 ? f.y : 1.0 - f.y);
+        if (axis.x * axis.y < 1e-3) continue;
+        const int2 texel = clamp(base + corner, int2(0, 0), int2(work) - 1);
+        const float4 d = t1.Load(int3(texel, 0));
+        const bool ok = all(isfinite(d.rgb)) && isfinite(d.a);
+        valid = ok ? min(valid, d.a) : 0.0;
+        detailLo = ok ? min(detailLo, d.rgb) : detailLo;
+        detailHi = ok ? max(detailHi, d.rgb) : detailHi;
+    }
+    if (valid < 0.999) return 0.0;
+
+    const float3 moved = clamp(SampleCatmullRom(t1, previousUv, work).rgb, detailLo, detailHi);
+    const float3 saved = ToYCoCg(t2.SampleLevel(gLinear, previousUv, 0).rgb);
+    const float3 excess = max(abs(saved - mean) - clipGamma * sigma, 0.0) / sigma;
+    const float colourTrust = 1.0 - saturate(max(excess.x, max(excess.y, excess.z)) / max(clipFalloff, 1e-3));
+    if (!all(isfinite(moved)) || !all(isfinite(saved))) return 0.0;
+    const float trust = saturate(colourTrust * MotionTrust(previousUv, raw));
+    return float4(moved, trust);
+}
+
+void Capture(uint2 p) {
+    const float3 input = t0.Load(int3(p, 0)).rgb;
+    const float3 answer = t1.Load(int3(p, 0)).rgb;
+    const float3 detail = answer - input;
+    const bool valid = all(isfinite(detail)) && all(isfinite(input)) && all(abs(detail) <= 65504.0);
+    u0[p] = float4(valid ? detail : 0.0, valid ? 1.0 : 0.0);
+    u1[p] = float4(all(isfinite(input)) ? input : 0.0, 0.0);
+}
+
+void Estimate(uint2 p) {
+    u0[p] = MovedDetail(p);
+}
+
+void Fill(uint2 p) {
+    const float3 input = t0.Load(int3(p, 0)).rgb;
+    const float4 estimate = t1.Load(int3(p, 0));
+    const bool estimateOk = all(isfinite(estimate.rgb)) && isfinite(estimate.a);
+    const float trust = estimateOk ? saturate(estimate.a) : 0.0;
+    const float3 own = estimateOk ? estimate.rgb * trust : 0.0;
+    float filled = 0.0;
+    float3 fillDetail = 0.0;
+    if (trust < 0.999 && fillStrength > 0.0) {
+        const float2 work = WorkSize();
+        float3 sum = 0.0;
+        float weightSum = 0.0;
+        [unroll] for (int k = 0; k < 16; ++k) {
+            const float radius = lerp(2.0, max(fillRadius, 2.0), sqrt((k + 0.5) / 16.0));
+            const float angle = 2.39996323 * k;
+            const int2 texel = clamp(int2(p) + int2(round(radius * float2(cos(angle), sin(angle)))),
+                int2(0, 0), int2(work) - 1);
+            const float4 tap = t1.Load(int3(texel, 0));
+            if (!all(isfinite(tap.rgb)) || !isfinite(tap.a) || tap.a <= 0.0) continue;
+            const float weight = saturate(tap.a);
+            sum += tap.rgb * weight;
+            weightSum += weight;
+        }
+        if (weightSum > 1e-3) {
+            fillDetail = sum / weightSum;
+            filled = (1.0 - trust) * saturate(fillStrength) * saturate(weightSum / 2.0);
+        }
+    }
+    float3 result = input + own + fillDetail * filled;
+    if (!all(isfinite(result))) result = input;
+    u0[p] = float4(result, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    const uint2 p = id.xy;
+    if (p.x >= workWidth || p.y >= workHeight) return;
+    if (mode == 0) Capture(p);
+    else if (mode == 1) Estimate(p);
+    else Fill(p);
 }
 )";
 
@@ -684,6 +887,41 @@ struct DLSSNRFilter::Impl {
 	winrt::com_ptr<ID3D11ShaderResourceView> sharedOutputSrv11;
 	winrt::com_ptr<ID3D11UnorderedAccessView> sharedInputUav11;
 	winrt::com_ptr<ID3D11ComputeShader> colorConvertShader11;
+	winrt::com_ptr<ID3D11ComputeShader> passFeedbackShader11;
+	winrt::com_ptr<ID3D11Buffer> passFeedbackCb11;
+	winrt::com_ptr<ID3D11Texture2D> passFeedbackScratch11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> passFeedbackScratchUav11;
+	winrt::com_ptr<ID3D11Texture2D> passProxy11;
+	winrt::com_ptr<ID3D11ComputeShader> detailReprojectShader11;
+	winrt::com_ptr<ID3D11Buffer> detailCb11;
+	winrt::com_ptr<ID3D11SamplerState> detailSampler11;
+	winrt::com_ptr<ID3D11Texture2D> detailStore11;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailStoreSrv11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> detailStoreUav11;
+	winrt::com_ptr<ID3D11Texture2D> detailColor11;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailColorSrv11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> detailColorUav11;
+	winrt::com_ptr<ID3D11Texture2D> detailEstimate11;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailEstimateSrv11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> detailEstimateUav11;
+	ID3D11Texture2D* detailAnswerRead = nullptr;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailAnswerReadSrv11;
+	winrt::com_ptr<ID3D11Texture2D> detailAnswer11;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailAnswerSrv11;
+	winrt::com_ptr<ID3D11Texture2D> detailInput11;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailInputSrv11;
+	ID3D11Texture2D* detailCurrentTexture = nullptr;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailCurrentSrv11;
+	ID3D11Texture2D* detailMotionTexture = nullptr;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailMotionSrv11;
+	ID3D11Texture2D* detailConfidenceTexture = nullptr;
+	winrt::com_ptr<ID3D11ShaderResourceView> detailConfidenceSrv11;
+	ID3D11Texture2D* detailOutputTexture = nullptr;
+	winrt::com_ptr<ID3D11UnorderedAccessView> detailOutputUav11;
+	bool detailValid = false;
+	bool detailReuseNext = false;
+	bool detailReuseFailed = false;
+	bool deviceRemoved = false;
 	winrt::com_ptr<ID3D11ComputeShader> colorDownsampleVerticalShader11;
 	winrt::com_ptr<ID3D11ComputeShader> colorDownsampleHorizontalShader11;
 	winrt::com_ptr<ID3D11ComputeShader> guidanceDownsampleShader11;
@@ -722,6 +960,10 @@ struct DLSSNRFilter::Impl {
 	uint64_t timestampFrequency = 0;
 	NVSDK_NGX_Parameter* parameters = nullptr;
 	NVSDK_NGX_Handle* feature = nullptr;
+	static constexpr uint32_t kMaxPasses = 4;
+	std::array<NVSDK_NGX_Handle*, kMaxPasses> passFeatures{};
+	bool extraPassRejected = false;
+	int renderPreset = 0;
 	HMODULE snippetModule = nullptr;
 	SnippetInitExtFn snippetInitExt = nullptr;
 	CreateFeatureFn snippetCreateFeature = nullptr;
@@ -1100,18 +1342,48 @@ static bool WaitForQueue(DLSSNRFilter::Impl& impl) noexcept {
 	return WaitForFence(impl, value);
 }
 
+static bool IsGpuDeviceLost(HRESULT hr) noexcept {
+	return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_HUNG ||
+		hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
+static void NoteDlssnrDeviceLost(DLSSNRFilter::Impl& impl, HRESULT hr) noexcept {
+	if (impl.deviceRemoved) return;
+	impl.deviceRemoved = true;
+	impl.disabled = true;
+	impl.detailValid = false;
+	impl.detailReuseNext = false;
+	impl.detailReuseFailed = false;
+	Logger::Get().ComError(
+		"DLSSNR stopped because the GPU device was removed. Quit Magpie completely before scaling again",
+		hr);
+}
+
+static bool DlssnrDeviceIsRemoved(DLSSNRFilter::Impl& impl) noexcept {
+	if (impl.deviceRemoved) return true;
+	if (!impl.device12) return false;
+	const HRESULT removed = impl.device12->GetDeviceRemovedReason();
+	if (SUCCEEDED(removed)) return false;
+	NoteDlssnrDeviceLost(impl, removed);
+	return true;
+}
+
 static void CollectGpuTiming(
 	DLSSNRFilter::Impl& impl,
 	DLSSNRFilter::Impl::CommandSlot& slot
 ) noexcept {
-	if (!slot.timestampPending || !impl.timestampReadback ||
+	if (impl.deviceRemoved || !slot.timestampPending || !impl.timestampReadback ||
 		!impl.timestampFrequency) return;
 	const size_t offset = size_t(slot.timestampQuery) * sizeof(uint64_t);
 	const D3D12_RANGE readRange{ offset, offset + sizeof(uint64_t) * 2 };
 	void* mapped = nullptr;
 	const HRESULT hr = impl.timestampReadback->Map(0, &readRange, &mapped);
 	if (FAILED(hr) || !mapped) {
-		Logger::Get().ComError("Read DLSSNR GPU timestamp failed", hr);
+		if (IsGpuDeviceLost(hr)) {
+			NoteDlssnrDeviceLost(impl, hr);
+		} else {
+			Logger::Get().ComError("Read DLSSNR GPU timestamp failed", hr);
+		}
 		slot.timestampPending = false;
 		return;
 	}
@@ -1141,21 +1413,28 @@ DLSSNRFilter::Impl::~Impl() {
 	if (queue12 && fence12) {
 		WaitForQueue(*this);
 	}
-	if (feature) {
-		DWORD sehCode = 0;
+	{
 		const auto function = useSignedSnippet ? snippetReleaseFeature :
 			static_cast<ReleaseFeatureFn>(&NVSDK_NGX_D3D12_ReleaseFeature);
-		const NVSDK_NGX_Result result = function ?
-			CallReleaseFeatureSafely(function, feature, &sehCode) :
-			NVSDK_NGX_Result_FAIL_NotInitialized;
-		if (sehCode) {
-			Logger::Get().Warn(fmt::format(
-				"DLSSNR ReleaseFeature raised SEH {:#x}", sehCode));
-		} else if (!NGXSucceeded(result)) {
-			Logger::Get().Warn(fmt::format(
-				"DLSSNR ReleaseFeature failed ({:#x})", (uint32_t)result));
+		auto releaseOne = [&](NVSDK_NGX_Handle*& handle) {
+			if (!handle || !function) return;
+			DWORD sehCode = 0;
+			const NVSDK_NGX_Result result =
+				CallReleaseFeatureSafely(function, handle, &sehCode);
+			if (sehCode) {
+				Logger::Get().Warn(fmt::format(
+					"DLSSNR ReleaseFeature raised SEH {:#x}", sehCode));
+			} else if (!NGXSucceeded(result)) {
+				Logger::Get().Warn(fmt::format(
+					"DLSSNR ReleaseFeature failed ({:#x})", (uint32_t)result));
+			}
+			handle = nullptr;
+		};
+		for (NVSDK_NGX_Handle*& handle : passFeatures) {
+			if (feature == handle) feature = nullptr;
+			releaseOne(handle);
 		}
-		feature = nullptr;
+		releaseOne(feature);
 	}
 	if (parameters) {
 		DWORD sehCode = 0;
@@ -1183,6 +1462,7 @@ DLSSNRFilter::Impl::~Impl() {
 		}
 		snippetInitialized = false;
 	}
+	DLSSNRNvapi::Restore(snippetModule);
 	const bool callerCompatibilityRestored =
 		RestoreSnippetCallerCompatibility(*this);
 	if (snippetModule) {
@@ -1260,11 +1540,21 @@ static bool UpdateInputShaderResource(
 	ID3D11Texture2D* input
 ) noexcept;
 
+static bool CreateComputeShader(
+	DLSSNRFilter::Impl& impl,
+	std::string_view source,
+	const char* entryPoint,
+	const char* sourceName,
+	winrt::com_ptr<ID3D11ComputeShader>& shader
+) noexcept;
+
 static bool CreateResolutionScalingResources(
 	DLSSNRFilter::Impl& impl,
 	ID3D11Texture2D* input,
 	const D3D11_TEXTURE2D_DESC& outputDesc
 ) noexcept;
+
+static bool CreateGuidanceResampleResources(DLSSNRFilter::Impl& impl) noexcept;
 
 static bool UpdateGuidanceResources(
 	DLSSNRFilter::Impl& impl,
@@ -1299,7 +1589,8 @@ static NVSDK_NGX_Result NVSDK_CONV SetScalingRatioCallback(
 }
 
 static void SetCreateParametersUnsafe(
-	DLSSNRFilter::Impl& impl
+	DLSSNRFilter::Impl& impl,
+	const DLSSNRSettings& settings
 ) {
 	impl.parameters->Set(PARAM_WIDTH, impl.width);
 	impl.parameters->Set(PARAM_HEIGHT, impl.height);
@@ -1315,9 +1606,13 @@ static void SetCreateParametersUnsafe(
 	impl.parameters->Set(
 		PARAM_SCALING_RATIO_CALLBACK,
 		FunctionAddress(&SetScalingRatioCallback));
-	// The preset is intentionally not user-facing. Keep the signed snippet's
-	// established default so old effect configurations cannot override it.
-	impl.parameters->Set(PARAM_PRESET, DEFAULT_NR_PRESET);
+	impl.parameters->Set(PARAM_PRESET, static_cast<unsigned>(settings.renderPreset));
+	impl.parameters->Set(PARAM_STYLE, settings.style);
+	impl.parameters->Set(PARAM_INTENSITY, settings.intensity);
+	impl.parameters->Set(PARAM_LOCAL_TONE, settings.localToneStrength);
+	impl.parameters->Set(PARAM_LOCAL_STRUCTURE, settings.localStructureStrength);
+	impl.parameters->Set("DLSSNR.SkinStructureStrength", settings.skinStructureStrength);
+	impl.parameters->Set(PARAM_AUTO_MASK, settings.useAutoMask ? 1 : 0);
 	impl.parameters->Set(NVSDK_NGX_Parameter_Width, impl.width);
 	impl.parameters->Set(NVSDK_NGX_Parameter_Height, impl.height);
 	impl.parameters->Set(
@@ -1329,11 +1624,12 @@ static void SetCreateParametersUnsafe(
 
 static bool SetCreateParametersSafely(
 	DLSSNRFilter::Impl& impl,
+	const DLSSNRSettings& settings,
 	DWORD* sehCode
 ) noexcept {
 	*sehCode = 0;
 	__try {
-		SetCreateParametersUnsafe(impl);
+		SetCreateParametersUnsafe(impl, settings);
 		return true;
 	} __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
 		return false;
@@ -1374,6 +1670,7 @@ static bool InitializeSignedSnippet(
 		return false;
 	}
 	if (!InstallSnippetCallerCompatibility(impl)) return false;
+	DLSSNRNvapi::Install(impl.snippetModule);
 
 	DWORD sehCode = 0;
 	const NVSDK_NGX_Result result = CallSnippetInitSafely(
@@ -1412,6 +1709,7 @@ static void SetEvaluateParametersUnsafe(
 		guidance.motion.metadata.validRegion);
 	SetSubrect(impl.parameters, RESOURCE_PARAMETERS[3],
 		guidance.depth.metadata.validRegion);
+	// Motion is already in source pixels. Scale 1 keeps that unit.
 	impl.parameters->Set(PARAM_MVEC_SCALE_X, 1.0f);
 	impl.parameters->Set(PARAM_MVEC_SCALE_Y, 1.0f);
 	impl.parameters->Set(PARAM_DEPTH_INVERTED, 1);
@@ -1424,6 +1722,8 @@ static void SetEvaluateParametersUnsafe(
 	impl.parameters->Set(PARAM_INTENSITY, settings.intensity);
 	impl.parameters->Set(PARAM_LOCAL_TONE, settings.localToneStrength);
 	impl.parameters->Set(PARAM_LOCAL_STRUCTURE, settings.localStructureStrength);
+	impl.parameters->Set("DLSSNR.SkinStructureStrength", settings.skinStructureStrength);
+	impl.parameters->Set(PARAM_PRESET, static_cast<unsigned>(settings.renderPreset));
 	impl.parameters->Set(PARAM_AUTO_MASK, settings.useAutoMask ? 1 : 0);
 	impl.parameters->Set(PARAM_UI_CORRECTION, 0);
 }
@@ -1559,16 +1859,19 @@ static bool UpdateGuidanceShaderResources(
 
 static bool PrepareReducedGuidance(
 	DLSSNRFilter::Impl& impl,
-	const FrameGuidanceView& guidance
+	const FrameGuidanceView& guidance,
+	FrameGuidanceExtent sourceExtent
 ) noexcept {
-	if (!UpdateGuidanceShaderResources(impl, guidance)) return false;
+	if (!sourceExtent.IsValid() || !UpdateGuidanceShaderResources(impl, guidance)) {
+		return false;
+	}
 	const ResampleConstants constants{
-		.sourceWidth = impl.sourceWidth,
-		.sourceHeight = impl.sourceHeight,
+		.sourceWidth = sourceExtent.width,
+		.sourceHeight = sourceExtent.height,
 		.targetWidth = impl.width,
 		.targetHeight = impl.height,
-		.motionScaleX = float(impl.width) / float(impl.sourceWidth),
-		.motionScaleY = float(impl.height) / float(impl.sourceHeight)
+		.motionScaleX = float(impl.width) / float(sourceExtent.width),
+		.motionScaleY = float(impl.height) / float(sourceExtent.height)
 	};
 	impl.context11->UpdateSubresource(
 		impl.resampleConstants11.get(), 0, nullptr, &constants, 0, 0);
@@ -1625,10 +1928,9 @@ static FrameGuidanceRegion ScaleGuidanceRegion(
 
 static FrameGuidanceView MakeReducedGuidance(
 	DLSSNRFilter::Impl& impl,
-	const FrameGuidanceView& source
+	const FrameGuidanceView& source,
+	FrameGuidanceExtent sourceExtent
 ) noexcept {
-	const FrameGuidanceExtent sourceExtent{
-		impl.sourceWidth, impl.sourceHeight };
 	const FrameGuidanceExtent targetExtent{ impl.width, impl.height };
 	auto reducedMetadata = [&](const FrameGuidanceMetadata& metadata) {
 		FrameGuidanceMetadata result = metadata;
@@ -1773,6 +2075,8 @@ bool DLSSNRFilter::Initialize(
 		}
 	} initStatus;
 	_settings = settings;
+	DLSSNRNvapi::SetReuseInterval(_settings.vitReuseInterval);
+	DLSSNRNvapi::NoteHybridRequest(_settings.modelPrecision != 0);
 	_settings.processingResolutionPercent = std::clamp(
 		_settings.processingResolutionPercent, 25u, 100u);
 	_impl.reset();
@@ -1802,14 +2106,21 @@ bool DLSSNRFilter::Initialize(
 	impl->sourceWidth = inputDesc.Width;
 	impl->sourceHeight = inputDesc.Height;
 	impl->useResolutionScaling = _settings.processingResolutionPercent < 100;
-	impl->width = impl->useResolutionScaling ? std::max(
+	auto alignWork = [](uint32_t size, uint32_t native) {
+		if (size >= native) return native;
+		const uint32_t aligned = std::max(16u, (size + 8u) / 16u * 16u);
+		return std::min(aligned, native);
+	};
+	impl->width = impl->useResolutionScaling ? alignWork(std::max(
 		1u, static_cast<uint32_t>(std::lround(
 			double(inputDesc.Width) *
-			double(_settings.processingResolutionPercent) / 100.0))) : inputDesc.Width;
-	impl->height = impl->useResolutionScaling ? std::max(
+			double(_settings.processingResolutionPercent) / 100.0))), inputDesc.Width)
+		: inputDesc.Width;
+	impl->height = impl->useResolutionScaling ? alignWork(std::max(
 		1u, static_cast<uint32_t>(std::lround(
 			double(inputDesc.Height) *
-			double(_settings.processingResolutionPercent) / 100.0))) : inputDesc.Height;
+			double(_settings.processingResolutionPercent) / 100.0))), inputDesc.Height)
+		: inputDesc.Height;
 	impl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
 
 	HRESULT hr = D3D12CreateDevice(
@@ -1817,6 +2128,11 @@ bool DLSSNRFilter::Initialize(
 		IID_PPV_ARGS(impl->device12.put()));
 	if (FAILED(hr)) {
 		Logger::Get().ComError("Create DLSSNR D3D12 device failed", hr);
+		if (hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DEVICE_REMOVED ||
+			hr == DXGI_ERROR_DEVICE_RESET) {
+			Logger::Get().Error(
+				"The GPU is still hung from the last scaling session. Quit Magpie completely, then start it again.");
+		}
 		return false;
 	}
 	D3D12_COMMAND_QUEUE_DESC queueDesc{};
@@ -1850,7 +2166,10 @@ bool DLSSNRFilter::Initialize(
 		if (!CreateResolutionScalingResources(*impl, input, outputDesc)) {
 			return false;
 		}
-	} else if (impl->convertInputToRgba) {
+	} else if (!CreateGuidanceResampleResources(*impl)) {
+		return false;
+	}
+	if (!impl->useResolutionScaling && impl->convertInputToRgba) {
 		hr = impl->device11->CreateShaderResourceView(
 			input, nullptr, impl->inputSrv11.put());
 		if (SUCCEEDED(hr)) {
@@ -1960,6 +2279,9 @@ bool DLSSNRFilter::Initialize(
 	impl->snippetModule = LoadLibraryExW(
 		runtimeSelection.path.c_str(), nullptr,
 		LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+	if (impl->snippetModule) {
+		DLSSNRNvapi::Install(impl->snippetModule);
+	}
 	if (!impl->snippetModule) {
 		Logger::Get().Win32Error(fmt::format(
 			"Preload selected nvngx_dlssnr.dll failed: {}",
@@ -2014,7 +2336,8 @@ bool DLSSNRFilter::Initialize(
 		return false;
 	}
 	sehCode = 0;
-	if (!SetCreateParametersSafely(*impl, &sehCode)) {
+	impl->renderPreset = _settings.renderPreset;
+	if (!SetCreateParametersSafely(*impl, _settings, &sehCode)) {
 		Logger::Get().Error(fmt::format(
 			"DLSSNR creation parameter setup raised SEH {:#x}", sehCode));
 		return false;
@@ -2042,6 +2365,7 @@ bool DLSSNRFilter::Initialize(
 			(uint32_t)result));
 		return false;
 	}
+	impl->passFeatures[0] = impl->feature;
 
 	hr = impl->commandList12->Close();
 	if (FAILED(hr)) {
@@ -2135,16 +2459,187 @@ static FrameGuidanceView SelectGuidance(
 	return selected.IsValidFor(context.frameId, extent) ? selected : zero;
 }
 
+DLSSNRSettings DLSSNRFilter::ResolvePassSettings(uint32_t pass) const noexcept {
+	DLSSNRSettings resolved = _settings;
+	if (pass == 0 || pass > 3) return resolved;
+	const DLSSNRSettings::PassTune& tune = _settings.laterPass[pass - 1];
+	if (tune.style >= 0) resolved.style = tune.style;
+	if (tune.intensity >= 0.0f) resolved.intensity = tune.intensity;
+	resolved.localToneStrength = tune.localToneStrength >= 0.0f ?
+		tune.localToneStrength : _settings.localToneStrength;
+	if (tune.localStructureStrength >= 0.0f) {
+		resolved.localStructureStrength = tune.localStructureStrength;
+	}
+	if (tune.skinStructureStrength >= 0.0f) {
+		resolved.skinStructureStrength = tune.skinStructureStrength;
+	}
+	if (tune.renderPreset >= 0) resolved.renderPreset = tune.renderPreset;
+	return resolved;
+}
+
+static bool EnsurePassFeedbackResources(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* output
+) noexcept {
+	if (!impl.passFeedbackShader11) {
+		if (!CreateComputeShader(
+			impl, PASS_FEEDBACK_HLSL, "BlendPassFeedback",
+			"DLSSNRPassFeedback", impl.passFeedbackShader11)) {
+			return false;
+		}
+	}
+	if (!impl.passFeedbackCb11) {
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = 16;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		const HRESULT hr = impl.device11->CreateBuffer(
+			&desc, nullptr, impl.passFeedbackCb11.put());
+		if (FAILED(hr)) return false;
+	}
+	D3D11_TEXTURE2D_DESC outputDesc{};
+	output->GetDesc(&outputDesc);
+	auto matches = [&](ID3D11Texture2D* texture) {
+		if (!texture) return false;
+		D3D11_TEXTURE2D_DESC desc{};
+		texture->GetDesc(&desc);
+		return desc.Width == outputDesc.Width && desc.Height == outputDesc.Height &&
+			desc.Format == outputDesc.Format;
+	};
+	if (!matches(impl.passFeedbackScratch11.get()) || !matches(impl.passProxy11.get())) {
+		impl.passFeedbackScratch11 = nullptr;
+		impl.passFeedbackScratchUav11 = nullptr;
+		impl.passProxy11 = nullptr;
+		D3D11_TEXTURE2D_DESC desc = outputDesc;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		desc.CPUAccessFlags = 0;
+		desc.MiscFlags = 0;
+		HRESULT hr = impl.device11->CreateTexture2D(
+			&desc, nullptr, impl.passFeedbackScratch11.put());
+		if (SUCCEEDED(hr)) {
+			hr = impl.device11->CreateUnorderedAccessView(
+				impl.passFeedbackScratch11.get(), nullptr,
+				impl.passFeedbackScratchUav11.put());
+		}
+		if (SUCCEEDED(hr)) {
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			hr = impl.device11->CreateTexture2D(
+				&desc, nullptr, impl.passProxy11.put());
+		}
+		if (FAILED(hr)) return false;
+	}
+	return impl.passFeedbackScratchUav11 && impl.passProxy11;
+}
+
+static bool ApplyPassFeedback(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* proxy,
+	ID3D11Texture2D* answer,
+	float feedback
+) noexcept {
+	if (!proxy || !answer || proxy == answer) return false;
+	if (!EnsurePassFeedbackResources(impl, answer)) return false;
+	winrt::com_ptr<ID3D11ShaderResourceView> proxySrv;
+	winrt::com_ptr<ID3D11ShaderResourceView> answerSrv;
+	HRESULT hr = impl.device11->CreateShaderResourceView(proxy, nullptr, proxySrv.put());
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateShaderResourceView(answer, nullptr, answerSrv.put());
+	}
+	if (FAILED(hr)) return false;
+	const float constants[4]{ feedback, 0, 0, 0 };
+	impl.context11->UpdateSubresource(
+		impl.passFeedbackCb11.get(), 0, nullptr, constants, 0, 0);
+	ID3D11ShaderResourceView* srvs[]{ proxySrv.get(), answerSrv.get() };
+	ID3D11UnorderedAccessView* uav = impl.passFeedbackScratchUav11.get();
+	ID3D11Buffer* buffer = impl.passFeedbackCb11.get();
+	impl.context11->CSSetShader(impl.passFeedbackShader11.get(), nullptr, 0);
+	impl.context11->CSSetShaderResources(0, 2, srvs);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	impl.context11->CSSetConstantBuffers(0, 1, &buffer);
+	D3D11_TEXTURE2D_DESC desc{};
+	answer->GetDesc(&desc);
+	impl.context11->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[]{ nullptr, nullptr };
+	ID3D11UnorderedAccessView* nullUav = nullptr;
+	ID3D11Buffer* nullBuffer = nullptr;
+	impl.context11->CSSetShaderResources(0, 2, nullSrvs);
+	impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+	impl.context11->CSSetConstantBuffers(0, 1, &nullBuffer);
+	impl.context11->CSSetShader(nullptr, nullptr, 0);
+	impl.context11->CopyResource(answer, impl.passFeedbackScratch11.get());
+	return true;
+}
+
+bool DLSSNRFilter::_EnsurePassFeature(uint32_t pass) noexcept {
+	if (!_impl || pass >= Impl::kMaxPasses) return false;
+	Impl& impl = *_impl;
+	if (impl.passFeatures[pass]) return true;
+	if (pass == 0 || impl.extraPassRejected || !impl.parameters) return false;
+	if (!WaitForQueue(impl)) return false;
+
+	HRESULT hr = impl.allocator12->Reset();
+	if (SUCCEEDED(hr)) {
+		hr = impl.commandList12->Reset(impl.allocator12.get(), nullptr);
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError("DLSSNR extra pass command list reset failed", hr);
+		impl.extraPassRejected = true;
+		return false;
+	}
+
+	DWORD sehCode = 0;
+	if (!SetCreateParametersSafely(impl, ResolvePassSettings(pass), &sehCode)) {
+		impl.commandList12->Close();
+		Logger::Get().Warn(fmt::format(
+			"DLSSNR pass {} create parameters raised SEH {:#x}; keeping earlier passes",
+			pass + 1, sehCode));
+		impl.extraPassRejected = true;
+		return false;
+	}
+
+	const Impl::CreateFeatureFn createFeature = ENABLE_CORE_FEATURE18_DIAGNOSTIC ?
+		static_cast<Impl::CreateFeatureFn>(&NVSDK_NGX_D3D12_CreateFeature) :
+		impl.snippetCreateFeature;
+	sehCode = 0;
+	const NVSDK_NGX_Result result = CallCreateFeatureSafely(
+		createFeature, impl.commandList12.get(), FEATURE_DLSSNR,
+		impl.parameters, &impl.passFeatures[pass], &sehCode);
+	hr = impl.commandList12->Close();
+	if (SUCCEEDED(hr)) {
+		ID3D12CommandList* lists[]{ impl.commandList12.get() };
+		impl.queue12->ExecuteCommandLists(1, lists);
+		WaitForQueue(impl);
+	}
+	if (sehCode || FAILED(hr) || !NGXSucceeded(result) || !impl.passFeatures[pass]) {
+		impl.passFeatures[pass] = nullptr;
+		impl.extraPassRejected = true;
+		Logger::Get().Warn(fmt::format(
+			"DLSSNR pass {} feature was not created ({:#x}, seh={:#x}); keeping earlier passes",
+			pass + 1, (uint32_t)result, sehCode));
+		return false;
+	}
+	Logger::Get().Info(fmt::format("DLSSNR pass {} has its own feature", pass + 1));
+	return true;
+}
+
 bool DLSSNRFilter::_DrawOnce(
 	const NativeEffectDrawContext& context,
+	NVSDK_NGX_Handle* feature,
 	bool forceHistoryReset
 ) noexcept {
-	if (!_impl || !_impl->feature || !_impl->parameters) {
+	if (!_impl || !feature || !_impl->parameters) {
 		return false;
 	}
 	Impl& impl = *_impl;
 	ID3D11Texture2D* input = context.input;
 	ID3D11Texture2D* output = context.output;
+	if (DlssnrDeviceIsRemoved(impl)) {
+		if (input != output) {
+			impl.context11->CopyResource(output, input);
+		}
+		return true;
+	}
 	auto fail = [&](std::string_view stage) noexcept {
 		impl.disabled = true;
 		g_dlssnrEvaluateFailureCount.fetch_add(1, std::memory_order_relaxed);
@@ -2161,6 +2656,12 @@ bool DLSSNRFilter::_DrawOnce(
 	const auto slotWaitStart = std::chrono::steady_clock::now();
 	if (commandSlot.completionValue &&
 		!WaitForFence(impl, commandSlot.completionValue)) {
+		if (DlssnrDeviceIsRemoved(impl)) {
+			if (input != output) {
+				impl.context11->CopyResource(output, input);
+			}
+			return true;
+		}
 		return fail("command-slot-wait");
 	}
 	const double slotWaitMs = std::chrono::duration<double, std::milli>(
@@ -2179,22 +2680,66 @@ bool DLSSNRFilter::_DrawOnce(
 		return true;
 	}
 	const auto guidancePrepareStart = std::chrono::steady_clock::now();
+	// A guidance miss used to set disabled for the rest of the session, so the
+	// filter passed the color through and looked like it was doing nothing.
+	auto passColor = [&](std::string_view stage) noexcept {
+		static uint32_t logged = 0;
+		if (logged < 3) {
+			++logged;
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR guidance skipped ({}); the color filter keeps running",
+				stage));
+		}
+		if (!impl.useResolutionScaling) {
+			impl.context11->CopyResource(output, impl.sharedInput11.get());
+			return true;
+		}
+		return false;
+	};
+	const auto guidanceExtentOf = [](const FrameGuidanceView& view) noexcept {
+		return view.motion.metadata.sourceExtent.width ?
+			view.motion.metadata.sourceExtent :
+			view.depth.metadata.sourceExtent;
+	};
+	const FrameGuidanceView& produced = context.frameGuidance;
+	const FrameGuidanceExtent producedExtent = guidanceExtentOf(produced);
+	const FrameGuidanceExtent selectExtent =
+		produced.IsValidFor(context.frameId, producedExtent) ? producedExtent :
+		guidanceExtentOf(context.zeroFrameGuidance);
 	const FrameGuidanceView guidance = SelectGuidance(
-		context, _settings, { impl.sourceWidth, impl.sourceHeight });
-	if (!impl.guidanceInterop->WaitForProducer(impl.context11, guidance)) {
-		return fail("guidance-interop");
+		context, _settings, selectExtent);
+	const FrameGuidanceExtent guidanceExtent = guidanceExtentOf(guidance);
+	if (!guidanceExtent.IsValid() ||
+		!impl.guidanceInterop->WaitForProducer(impl.context11, guidance)) {
+		return passColor("producer-wait");
 	}
 	FrameGuidanceView reducedGuidance;
 	const FrameGuidanceView* evaluateGuidance = &guidance;
-	if (impl.useResolutionScaling) {
-		if (!PrepareReducedGuidance(impl, guidance)) {
-			return fail("guidance-downsample");
+	const FrameGuidanceExtent colorExtent{ impl.width, impl.height };
+	const bool resampleGuidance = impl.useResolutionScaling ||
+		guidanceExtent.width != colorExtent.width ||
+		guidanceExtent.height != colorExtent.height;
+	if (resampleGuidance) {
+		if (!impl.guidanceDownsampleShader11 &&
+			!CreateGuidanceResampleResources(impl)) {
+			return passColor("guidance-resample");
 		}
-		reducedGuidance = MakeReducedGuidance(impl, guidance);
+		if (!PrepareReducedGuidance(impl, guidance, guidanceExtent)) {
+			return passColor("guidance-resample");
+		}
+		reducedGuidance = MakeReducedGuidance(impl, guidance, guidanceExtent);
 		evaluateGuidance = &reducedGuidance;
+		static bool loggedResample = false;
+		if (!loggedResample) {
+			loggedResample = true;
+			Logger::Get().Info(fmt::format(
+				"DLSSNR resampling frame guidance from {}x{} to {}x{}",
+				guidanceExtent.width, guidanceExtent.height,
+				colorExtent.width, colorExtent.height));
+		}
 	}
 	if (!UpdateGuidanceResources(impl, *evaluateGuidance, context.frameId)) {
-		return fail("guidance-interop");
+		return passColor("guidance-interop");
 	}
 	const double guidancePrepareMs = std::chrono::duration<double, std::milli>(
 		std::chrono::steady_clock::now() - guidancePrepareStart).count();
@@ -2239,7 +2784,8 @@ bool DLSSNRFilter::_DrawOnce(
 			impl.lastGuidanceResetFrameId != context.frameId);
 	DWORD sehCode = 0;
 	if (!SetEvaluateParametersSafely(
-		impl, _settings, *evaluateGuidance, guidanceReset, &sehCode)) {
+		impl, _activeSettings ? *_activeSettings : _settings,
+		*evaluateGuidance, guidanceReset, &sehCode)) {
 		commandList->Close();
 		Logger::Get().Error(fmt::format(
 			"DLSSNR evaluation parameter setup raised SEH {:#x}", sehCode));
@@ -2254,9 +2800,12 @@ bool DLSSNRFilter::_DrawOnce(
 	const Impl::EvaluateFeatureFn evaluateFeature = impl.useSignedSnippet ?
 		impl.snippetEvaluateFeature :
 		static_cast<Impl::EvaluateFeatureFn>(&NVSDK_NGX_D3D12_EvaluateFeature);
+	DLSSNRNvapi::SetReuseInterval(_settings.vitReuseInterval);
+	DLSSNRNvapi::BeginEvaluate(feature, forceHistoryReset, static_cast<long long>(context.frameId), commandList);
 	const NVSDK_NGX_Result result = CallEvaluateFeatureSafely(
-		evaluateFeature, commandList, impl.feature,
+		evaluateFeature, commandList, feature,
 		impl.parameters, &sehCode);
+	DLSSNRNvapi::EndEvaluate(commandList);
 	const double evaluateCpuMs = std::chrono::duration<double, std::milli>(
 		std::chrono::steady_clock::now() - evaluateStart).count();
 	if (impl.timestampQueryHeap) {
@@ -2332,6 +2881,11 @@ bool DLSSNRFilter::_DrawOnce(
 	} else {
 		impl.context11->CopyResource(
 			output, impl.disabled ? impl.sharedInput11.get() : impl.sharedOutput11.get());
+		static bool loggedCopy = false;
+		if (!loggedCopy) {
+			loggedCopy = true;
+			Logger::Get().Info("DLSSNR copies model output the same way as the original fork");
+		}
 	}
 	const double submitMs = std::chrono::duration<double, std::milli>(
 		std::chrono::steady_clock::now() - submitStart).count();
@@ -2406,6 +2960,66 @@ static bool UpdateInputShaderResource(
 	impl.inputSrv11 = std::move(srv);
 	impl.inputTexture11 = input;
 	return true;
+}
+
+static bool CreateGuidanceResampleResources(DLSSNRFilter::Impl& impl) noexcept {
+	if (impl.guidanceDownsampleShader11 && impl.reducedMotion11 &&
+		impl.resampleConstants11) {
+		return true;
+	}
+	constexpr UINT GUIDANCE_BIND_FLAGS =
+		D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	constexpr UINT GUIDANCE_MISC_FLAGS =
+		D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	if (!impl.reducedMotion11) {
+		impl.reducedMotion11 = DirectXHelper::CreateTexture2D(
+			impl.device11, DXGI_FORMAT_R16G16_FLOAT, impl.width, impl.height,
+			GUIDANCE_BIND_FLAGS, D3D11_USAGE_DEFAULT, GUIDANCE_MISC_FLAGS);
+		impl.reducedDepth11 = DirectXHelper::CreateTexture2D(
+			impl.device11, DXGI_FORMAT_R32_FLOAT, impl.width, impl.height,
+			GUIDANCE_BIND_FLAGS, D3D11_USAGE_DEFAULT, GUIDANCE_MISC_FLAGS);
+		impl.reducedConfidence11 = DirectXHelper::CreateTexture2D(
+			impl.device11, DXGI_FORMAT_R8_UNORM, impl.width, impl.height,
+			GUIDANCE_BIND_FLAGS, D3D11_USAGE_DEFAULT, GUIDANCE_MISC_FLAGS);
+	}
+	if (!impl.reducedMotion11 || !impl.reducedDepth11 || !impl.reducedConfidence11) {
+		Logger::Get().Error("Create DLSSNR guidance resample textures failed");
+		return false;
+	}
+	HRESULT hr = S_OK;
+	if (!impl.reducedMotionUav11) {
+		hr = impl.device11->CreateUnorderedAccessView(
+			impl.reducedMotion11.get(), nullptr, impl.reducedMotionUav11.put());
+		if (SUCCEEDED(hr)) {
+			hr = impl.device11->CreateUnorderedAccessView(
+				impl.reducedDepth11.get(), nullptr, impl.reducedDepthUav11.put());
+		}
+		if (SUCCEEDED(hr)) {
+			hr = impl.device11->CreateUnorderedAccessView(
+				impl.reducedConfidence11.get(), nullptr,
+				impl.reducedConfidenceUav11.put());
+		}
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError("Create DLSSNR guidance resample UAVs failed", hr);
+		return false;
+	}
+	if (!impl.resampleConstants11) {
+		D3D11_BUFFER_DESC constantsDesc{};
+		constantsDesc.ByteWidth = sizeof(ResampleConstants);
+		constantsDesc.Usage = D3D11_USAGE_DEFAULT;
+		constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		hr = impl.device11->CreateBuffer(
+			&constantsDesc, nullptr, impl.resampleConstants11.put());
+		if (FAILED(hr)) {
+			Logger::Get().ComError(
+				"Create DLSSNR guidance resample constants failed", hr);
+			return false;
+		}
+	}
+	return impl.guidanceDownsampleShader11 || CreateComputeShader(
+		impl, GUIDANCE_DOWNSAMPLE_HLSL, "DownsampleGuidance",
+		"DLSSNRGuidanceDownsample", impl.guidanceDownsampleShader11);
 }
 
 static bool CreateResolutionScalingResources(
@@ -2553,6 +3167,244 @@ static bool CreateResolutionScalingResources(
 			impl.residualVerticalCompositeShader11);
 }
 
+
+static void UnbindDetailReuse(DLSSNRFilter::Impl& impl) noexcept {
+	ID3D11ShaderResourceView* nullSrvs[]{ nullptr, nullptr, nullptr, nullptr, nullptr };
+	ID3D11UnorderedAccessView* nullUavs[]{ nullptr, nullptr };
+	impl.context11->CSSetShaderResources(0, 5, nullSrvs);
+	impl.context11->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+	impl.context11->CSSetShader(nullptr, nullptr, 0);
+}
+
+static bool EnsureDetailSrv(
+	ID3D11Device* device,
+	ID3D11Texture2D* texture,
+	ID3D11Texture2D*& cached,
+	winrt::com_ptr<ID3D11ShaderResourceView>& srv
+) noexcept {
+	if (!texture) return false;
+	if (cached == texture && srv) return true;
+	winrt::com_ptr<ID3D11ShaderResourceView> created;
+	const HRESULT hr = device->CreateShaderResourceView(
+		texture, nullptr, created.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("Create DLSSNR detail reuse SRV failed", hr);
+		return false;
+	}
+	srv = std::move(created);
+	cached = texture;
+	return true;
+}
+
+static bool EnsureDetailUav(
+	ID3D11Device* device,
+	ID3D11Texture2D* texture,
+	ID3D11Texture2D*& cached,
+	winrt::com_ptr<ID3D11UnorderedAccessView>& uav
+) noexcept {
+	if (!texture) return false;
+	if (cached == texture && uav) return true;
+	winrt::com_ptr<ID3D11UnorderedAccessView> created;
+	const HRESULT hr = device->CreateUnorderedAccessView(
+		texture, nullptr, created.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("Create DLSSNR detail reuse UAV failed", hr);
+		return false;
+	}
+	uav = std::move(created);
+	cached = texture;
+	return true;
+}
+
+struct DetailReuseCB {
+	uint32_t mode;
+	uint32_t workWidth;
+	uint32_t workHeight;
+	float clipGamma;
+	float clipFalloff;
+	float sigmaFloor;
+	float motionReject;
+	float fillStrength;
+	float fillRadius;
+	float pad0;
+	float pad1;
+	float pad2;
+};
+static_assert(sizeof(DetailReuseCB) == 48);
+
+static bool EnsureFloatTarget(
+	DLSSNRFilter::Impl& impl,
+	uint32_t width,
+	uint32_t height,
+	winrt::com_ptr<ID3D11Texture2D>& texture,
+	winrt::com_ptr<ID3D11ShaderResourceView>& srv,
+	winrt::com_ptr<ID3D11UnorderedAccessView>& uav
+) noexcept {
+	D3D11_TEXTURE2D_DESC have{};
+	if (texture) texture->GetDesc(&have);
+	if (texture && srv && uav && have.Width == width && have.Height == height &&
+		have.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+		return true;
+	}
+	texture = DirectXHelper::CreateTexture2D(
+		impl.device11, DXGI_FORMAT_R16G16B16A16_FLOAT, width, height,
+		D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+	srv = nullptr;
+	uav = nullptr;
+	if (!texture) return false;
+	HRESULT hr = impl.device11->CreateShaderResourceView(texture.get(), nullptr, srv.put());
+	if (SUCCEEDED(hr)) {
+		hr = impl.device11->CreateUnorderedAccessView(texture.get(), nullptr, uav.put());
+	}
+	if (FAILED(hr)) {
+		Logger::Get().ComError("Create DLSSNR detail reuse float target failed", hr);
+		texture = nullptr;
+		return false;
+	}
+	return true;
+}
+
+static bool EnsureDetailReusePipeline(DLSSNRFilter::Impl& impl) noexcept {
+	if (!impl.detailReprojectShader11 && !CreateComputeShader(
+		impl, DETAIL_REPROJECT_HLSL, "CSMain",
+		"DLSSNRDetailReproject", impl.detailReprojectShader11)) {
+		impl.detailReuseFailed = true;
+		Logger::Get().Error(
+			"DLSSNR detail reuse shader failed. Later frames run the denoiser.");
+		return false;
+	}
+	if (!impl.detailSampler11) {
+		D3D11_SAMPLER_DESC desc{};
+		desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		desc.AddressU = desc.AddressV = desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		const HRESULT hr = impl.device11->CreateSamplerState(&desc, impl.detailSampler11.put());
+		if (FAILED(hr)) {
+			Logger::Get().ComError("Create DLSSNR detail reuse sampler failed", hr);
+			return false;
+		}
+	}
+	if (!impl.detailCb11) {
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = sizeof(DetailReuseCB);
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		const HRESULT hr = impl.device11->CreateBuffer(&desc, nullptr, impl.detailCb11.put());
+		if (FAILED(hr)) {
+			Logger::Get().ComError("Create DLSSNR detail reuse constants failed", hr);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool DispatchDetailReuse(
+	DLSSNRFilter::Impl& impl,
+	const DetailReuseCB& constants,
+	std::initializer_list<ID3D11ShaderResourceView*> srvs,
+	std::initializer_list<ID3D11UnorderedAccessView*> uavs
+) noexcept {
+	impl.context11->UpdateSubresource(impl.detailCb11.get(), 0, nullptr, &constants, 0, 0);
+	ID3D11ShaderResourceView* srvSlots[4]{};
+	ID3D11UnorderedAccessView* uavSlots[2]{};
+	uint32_t i = 0;
+	for (ID3D11ShaderResourceView* srv : srvs) {
+		if (i < 4) srvSlots[i++] = srv;
+	}
+	i = 0;
+	for (ID3D11UnorderedAccessView* uav : uavs) {
+		if (i < 2) uavSlots[i++] = uav;
+	}
+	ID3D11Buffer* cb = impl.detailCb11.get();
+	ID3D11SamplerState* sampler = impl.detailSampler11.get();
+	impl.context11->CSSetShader(impl.detailReprojectShader11.get(), nullptr, 0);
+	impl.context11->CSSetConstantBuffers(0, 1, &cb);
+	impl.context11->CSSetSamplers(0, 1, &sampler);
+	impl.context11->CSSetShaderResources(0, 4, srvSlots);
+	impl.context11->CSSetUnorderedAccessViews(0, 2, uavSlots, nullptr);
+	impl.context11->Dispatch(
+		(constants.workWidth + 7) / 8, (constants.workHeight + 7) / 8, 1);
+	UnbindDetailReuse(impl);
+	ID3D11Buffer* nullCb = nullptr;
+	ID3D11SamplerState* nullSampler = nullptr;
+	impl.context11->CSSetConstantBuffers(0, 1, &nullCb);
+	impl.context11->CSSetSamplers(0, 1, &nullSampler);
+	return true;
+}
+
+static DetailReuseCB MakeDetailReuseConstants(uint32_t mode, uint32_t width, uint32_t height) noexcept {
+	const float areaScale = std::clamp(
+		std::sqrt(float(width) * float(height) / (1920.0f * 1080.0f)), 0.5f, 2.0f);
+	return DetailReuseCB{
+		.mode = mode,
+		.workWidth = width,
+		.workHeight = height,
+		.clipGamma = 1.25f,
+		.clipFalloff = 1.0f,
+		.sigmaFloor = 0.01f,
+		.motionReject = 0.5f,
+		.fillStrength = 1.0f,
+		.fillRadius = 24.0f * areaScale
+	};
+}
+
+static bool CaptureNrHistory(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* input,
+	ID3D11Texture2D* answer
+) noexcept {
+	if (impl.detailReuseFailed || !input || !answer) return false;
+	D3D11_TEXTURE2D_DESC desc{};
+	input->GetDesc(&desc);
+	if (!EnsureDetailReusePipeline(impl) ||
+		!EnsureFloatTarget(impl, desc.Width, desc.Height, impl.detailStore11, impl.detailStoreSrv11, impl.detailStoreUav11) ||
+		!EnsureFloatTarget(impl, desc.Width, desc.Height, impl.detailColor11, impl.detailColorSrv11, impl.detailColorUav11) ||
+		!EnsureDetailSrv(impl.device11, input, impl.detailCurrentTexture, impl.detailCurrentSrv11) ||
+		!EnsureDetailSrv(impl.device11, answer, impl.detailAnswerRead, impl.detailAnswerReadSrv11)) {
+		return false;
+	}
+	UnbindDetailReuse(impl);
+	return DispatchDetailReuse(
+		impl, MakeDetailReuseConstants(0, desc.Width, desc.Height),
+		{ impl.detailCurrentSrv11.get(), impl.detailAnswerReadSrv11.get(),
+			impl.detailCurrentSrv11.get(), impl.detailCurrentSrv11.get() },
+		{ impl.detailStoreUav11.get(), impl.detailColorUav11.get() });
+}
+
+static bool ReprojectNrDetail(
+	DLSSNRFilter::Impl& impl,
+	ID3D11Texture2D* current,
+	ID3D11Texture2D* motion,
+	ID3D11Texture2D* output
+) noexcept {
+	if (impl.detailReuseFailed || !current || !motion || !output || current == output ||
+		!impl.detailStoreSrv11 || !impl.detailColorSrv11) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC desc{};
+	current->GetDesc(&desc);
+	if (!EnsureDetailReusePipeline(impl) ||
+		!EnsureFloatTarget(
+			impl, desc.Width, desc.Height, impl.detailEstimate11,
+			impl.detailEstimateSrv11, impl.detailEstimateUav11) ||
+		!EnsureDetailSrv(impl.device11, current, impl.detailCurrentTexture, impl.detailCurrentSrv11) ||
+		!EnsureDetailSrv(impl.device11, motion, impl.detailMotionTexture, impl.detailMotionSrv11) ||
+		!EnsureDetailUav(impl.device11, output, impl.detailOutputTexture, impl.detailOutputUav11)) {
+		return false;
+	}
+	if (!DispatchDetailReuse(
+		impl, MakeDetailReuseConstants(1, desc.Width, desc.Height),
+		{ impl.detailCurrentSrv11.get(), impl.detailStoreSrv11.get(),
+			impl.detailColorSrv11.get(), impl.detailMotionSrv11.get() },
+		{ impl.detailEstimateUav11.get(), nullptr })) {
+		return false;
+	}
+	return DispatchDetailReuse(
+		impl, MakeDetailReuseConstants(2, desc.Width, desc.Height),
+		{ impl.detailCurrentSrv11.get(), impl.detailEstimateSrv11.get(),
+			impl.detailCurrentSrv11.get(), impl.detailMotionSrv11.get() },
+		{ impl.detailOutputUav11.get(), nullptr });
+}
+
 bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	const bool hasUsableMotion = _settings.guidanceMode != 1 &&
 		_settings.guidanceMode != 3 &&
@@ -2560,8 +3412,49 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 		!context.frameGuidance.motion.metadata.isZero;
 	const bool forceHistoryReset = _settings.historyMode == 1 ||
 		(_settings.historyMode == 0 && !hasUsableMotion);
-	if (!_DrawOnce(context, forceHistoryReset)) return false;
-	for (uint32_t pass = 1; pass < _settings.passes; ++pass) {
+	if (!_impl || !_impl->passFeatures[0]) return false;
+	if (DlssnrDeviceIsRemoved(*_impl)) {
+		if (context.input != context.output) {
+			_impl->context11->CopyResource(context.output, context.input);
+		}
+		return true;
+	}
+	if (_settings.detailReuse && _impl->detailReuseNext && _impl->detailValid &&
+		ReprojectNrDetail(
+			*_impl, context.input,
+			context.frameGuidance.motion.texture,
+			context.output)) {
+		static bool loggedReuse = false;
+		if (!loggedReuse) {
+			loggedReuse = true;
+			Logger::Get().Info(
+				"DLSSNR detail reuse moves the saved detail with a soft colour trust and fills the gaps.");
+		}
+		_impl->detailReuseNext = false;
+		return true;
+	}
+	const DLSSNRSettings firstPass = ResolvePassSettings(0);
+	_activeSettings = &firstPass;
+	const bool firstOk = _DrawOnce(
+		context, _impl->passFeatures[0], forceHistoryReset);
+	_activeSettings = nullptr;
+	if (!firstOk) return false;
+	const uint32_t passCount = std::min(_settings.passes, DLSSNRFilter::Impl::kMaxPasses);
+	ID3D11Texture2D* proxy = context.input;
+	for (uint32_t pass = 1; pass < passCount; ++pass) {
+		if (!_EnsurePassFeature(pass)) break;
+		if (_settings.passFeedback < 0.999f) {
+			if (!ApplyPassFeedback(*_impl, proxy, context.output, _settings.passFeedback)) {
+				return false;
+			}
+			if (pass + 1 < passCount) {
+				_impl->context11->CopyResource(
+					_impl->passProxy11.get(), context.output);
+				proxy = _impl->passProxy11.get();
+			}
+		}
+		const DLSSNRSettings passSettings = ResolvePassSettings(pass);
+		_activeSettings = &passSettings;
 		const NativeEffectDrawContext repeated{
 			.input = context.output,
 			.output = context.output,
@@ -2569,7 +3462,18 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 			.frameGuidance = context.frameGuidance,
 			.zeroFrameGuidance = context.zeroFrameGuidance
 		};
-		if (!_DrawOnce(repeated)) return false;
+		const bool passOk = _DrawOnce(
+			repeated, _impl->passFeatures[pass], forceHistoryReset);
+		_activeSettings = nullptr;
+		if (!passOk) return false;
+	}
+	if (_settings.detailReuse && !_impl->detailReuseFailed &&
+		CaptureNrHistory(*_impl, context.input, context.output)) {
+		_impl->detailValid = true;
+		_impl->detailReuseNext = true;
+	} else {
+		_impl->detailValid = false;
+		_impl->detailReuseNext = false;
 	}
 	return true;
 }

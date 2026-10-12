@@ -25,7 +25,7 @@ Fork 维护者使用 OpenAI Codex 辅助开发和测试了以下基于捕获帧�
 
 - NVIDIA DLSS Super Resolution：复用 NVIDIA Optical Flow 运动信息，并可选使用估算深度。
 - NVIDIA DLSS Frame Generation：支持 x2-x6 倍率，输出稳定在显示器刷新率且不会超过，并复用同一份 Frame Guidance。
-- NVIDIA DLSSNR：通过本地提供的直接运行时实现同分辨率 SDR AI 滤镜。
+- NVIDIA DLSSNR：通过本地提供的直接运行时实现同分辨率 AI 滤镜，并包含 HDR 桌面捕获。
 - AMD FidelityFX Super Resolution 2.2.1：零运动向量、伪 jitter 元数据或 50% 分辨率颜色光流。
 - AMD FidelityFX Super Resolution 3.1.5 上采样（不含帧生成）：通过 D3D11/D3D12 互操作提供零运动向量、伪 jitter 元数据或 50% 分辨率颜色光流模式。
 - AMD FidelityFX Super Resolution 4.1.1 INT8：提供 Zero-MV、伪 jitter 和 50% 分辨率颜色光流实验模式。
@@ -72,9 +72,21 @@ Fork 维护者使用 OpenAI Codex 辅助开发和测试了以下基于捕获帧�
 
 #### DLSSNR AI 滤镜
 
-`DLSSNR_AI_Filter` 是同分辨率 SDR 后处理，不承担放大，并复用 Frame Guidance。Effect 提供 Style、Intensity、Local Tone、Local Structure、Automatic Mask 和 Frame Guidance；NR Preset 固定使用内部默认值。
+`DLSSNR_AI_Filter` 是同分辨率后处理，不承担放大，并复用 Frame Guidance。最多四次处理各自保留历史。每一次都可以设置 Style、Intensity、Local Tone、Local Structure、Skin、Preset 和 Automatic Mask。第 2–4 次在对应控件为 −1 时继承第一次的设置。Pass feedback 把上一次的结果混进下一次。降低处理分辨率时，工作尺寸会取整到 16 像素的倍数。
 
-Feature 18 直接调用本地提供的 `nvngx_dlssnr.dll` 的 D3D12 导出；NGX Core 只负责参数块的分配与销毁。它无法分离已经合成到画面中的 UI，仍可能改变文字/UI，并在动态画面产生拖影或结构漂移。HDR 暂不支持。
+Feature 18 直接调用本地提供的 `nvngx_dlssnr.dll` 的 D3D12 导出；NGX Core 只负责参数块的分配与销毁。它无法分离已经合成到画面中的 UI，仍可能改变文字/UI，并在动态画面产生拖影或结构漂移。
+
+| 控件 | 行为 |
+| --- | --- |
+| Detail Reuse | 隔帧跳过模型。保存的细节按光流运动到新画面上，缺口用邻近的可信细节补上，避免复用帧闪回原始画面。 |
+| ViT Reuse | 设为 `2` 时隔帧跳过 ViT 瓶颈。设为 `1` 时每帧都计算。 |
+| NVFP4 Hybrid | 在 RTX 50 上把八个 FFN 块换成 NVFP4，其余算子保持 FP8。文件放在 `Magpie.exe` 旁边的 `DLSSNR-Hybrid`。源码构建如果缺少该文件夹，可运行 `tools/get_dlssnr_hybrid_assets.ps1`。 |
+
+#### HDR 捕获与呈现
+
+HDR 桌面把 SDR 窗口存成 scRGB。用 8 位捕获会把这个范围钳掉，效果开始之前颜色就已经错了。桌面提供浮点格式时，Graphics Capture 使用 `R16G16B16A16_FLOAT`，读取 SDR 白点的尼特值，再转换成 sRGB 送进效果链。
+
+在 HDR 显示器上，撕裂交换链会把这张 8 位图当成线性光扫描。DLSS 帧生成输出到 HDR 显示器时，这张 8 位图交给 DWM，由 DWM 按桌面做 SDR 到 HDR 的转换。效果链和帧生成的后备缓冲保持 8 位 sRGB。纸白、色彩曲线和 `.cube` 色彩查找表还不在这个版本里。
 
 #### 帧生成实验
 
@@ -113,6 +125,12 @@ DLSS FG 位于效果链之后，可复用与 DLSS SR 相同捕获帧的运动信
 请选择在预期最低源帧率下仍能达到刷新率的最低倍率；更高倍率只会增加被跳过的工作。该行为没有开关。启动日志会显示刷新率、呈现上限和倍率；每秒一行的 `DLSSFG presentation` 日志会显示 captured、submitted 和 source 帧率。
 
 生成帧通过 FLIP_SEQUENTIAL、允许撕裂、最大帧延迟为 1 的交换链连续呈现；帧路径中没有基于 sleep 的节奏控制或呈现队列。DLSS FG 启用时，后端通过两张交替使用的 keyed-mutex 共享纹理把帧交给呈现线程，发布下一帧时无需等待上一帧复制完成。NVIDIA Optical Flow 使用 FAST 预设；源大于 1280x720 时以半分辨率运行，并把光流缩放回源像素。全分辨率 MEDIUM 光流在 1440p 下每帧耗时数毫秒，会使 DLSS FG 低于源帧率。
+
+#### RTX 40 帧间距与动态帧生成
+
+`Ada Temporal Fix` 作用于 RTX 40。它把额外帧均匀排进两帧真实画面之间，而不是全部停在正中间，并把已接受的混合权重抬到至少 0.85。RTX 50 本身就会这样排帧，该补丁不会改动这块 GPU。额外的离线质量内核还不在这个版本里。
+
+`Dynamic Frame Generation` 按显示器刷新率选择倍率；`Dynamic Target FPS` 不为 0 时改用那个帧率。动态开启时固定倍率会变灰。上面的刷新率预算仍会丢掉会使输出超过显示器的生成帧。5x 和 6x 在 RTX 50 上可用，RTX 40 需要打开 Ada 时序修复。其他 GPU 最高到 4x。驱动报告的更低上限优先。生成帧会进入 Elgato Studio 等采集应用能看到的呈现路径。
 
 #### FSR 2.2.1
 
@@ -179,7 +197,7 @@ XeSS 使用跨厂商 D3D12 DP4a 路径，可以在兼容的 Intel、NVIDIA 和 A
 
 如需编译可选后端，请自行新建 `src/BuildOptions.props.user`，并在其中设置功能开关和本机 SDK 路径。该文件已被 `.gitignore` 排除，只用于本机配置，不应提交到公共仓库。[启用全部可选后端的编译方法](docs/BUILD_ALL_FEATURES.md)列出了每个开关对应的已测试依赖版本、下载来源、目录结构要求和示例文件。
 
-v1.9.0 任意窗口源码为 RTX 20、RTX 30、RTX 40 和 RTX 50 提供独立的运行库选择分支。外部 RTX 3090 实机已经确认 RTX 30 分支能够启动并产生可见处理效果。控制器提供可以分别修改的滤镜开关快捷键与浮窗隐藏/显示快捷键，支持 `Ctrl+A` 等双键组合，并带有 GitHub 更新检查和项目源码链接的“关于”页。运行库和模型 DLL 仅作为本机构建输入，不包含在本源码树或 GitHub 自动生成的源码归档中。自动更新范围及安全行为见 [v1.9.0 发布说明](docs/RELEASE_NOTES_v1.9.0-auto-update.md)。
+1.10.0 保留 1.9.2 的 RTX 20、RTX 30、RTX 40 和 RTX 50 运行库分支。控制器仍提供可分别修改的滤镜开关与浮窗快捷键、`Ctrl+A` 等双键组合，以及“关于”页。更新器检查[本分支仓库](https://github.com/UncleTyrone/DLSS5-AnyWindow)，并能在 SHA-256 校验和回滚保护下替换控制器、外部窗口渲染器和 DLSSNR 效果。本机设置、GPU 运行库和模型保持不变。运行库和模型 DLL 仍只作为本机构建输入，不包含在源码树中。上方各节是当前行为。详见 [1.10.0 发布说明](docs/RELEASE_NOTES_v1.10.0.md)。
 
 原生上采样器和 RTX Video 已统一通过 `NativeEffectBackend` 接口与 `NativeEffectBackendFactory` 分派，将各 SDK 的识别、创建、尺寸调整和绘制逻辑从 Renderer 主路径中移出。帧生成 Presenter 仍保持独立，因为它们需要在最终呈现阶段发布额外帧。
 
@@ -299,4 +317,4 @@ Magpie 派生源码继续采用 GPLv3，发布源码时必须保留上游版权�
 
 ## 许可协议
 
-本项目采用 GPLv3 许可协议。
+本项目采用 GPLv3 许可协议。RTX 40 的中点帧间距改写改编自 mavismmg 以 MIT 许可发布的 MFGAdaUnlock-RenoDx，见 `Licenses/MFGAdaUnlock-RenoDx-MIT.txt`。RTX 50 的 NVFP4 hybrid 改编自 janblade 以 GPL-3.0 发布的 OptiScaler 工作，见 `Licenses/janblade-OptiScaler-GPL-3.0.txt`。

@@ -25,7 +25,7 @@ The fork owner used OpenAI Codex as a development assistant to add and test expe
 
 - NVIDIA DLSS Super Resolution with shared NVIDIA Optical Flow motion and optional estimated depth.
 - NVIDIA DLSS Frame Generation with 2x-6x multipliers that holds output at the display refresh rate without exceeding it, with the same shared guidance.
-- NVIDIA DLSSNR as a same-resolution SDR AI filter through a locally supplied direct-runtime path.
+- NVIDIA DLSSNR as a same-resolution AI filter through a locally supplied direct-runtime path, including HDR-desktop capture.
 - AMD FidelityFX Super Resolution 2.2.1 with zero motion vectors, synthetic jitter metadata, or 50%-resolution colour optical flow.
 - AMD FidelityFX Super Resolution 3.1.5 upscaling (without frame generation) through D3D11/D3D12 interoperability, with zero motion vectors, synthetic jitter metadata, or 50%-resolution colour optical flow.
 - AMD FidelityFX Super Resolution 4.1.1 INT8 with experimental Zero-MV, synthetic-jitter, and 50%-resolution colour-optical-flow modes.
@@ -72,9 +72,21 @@ Creating a dedicated Magpie application profile in NVIDIA Profile Inspector is r
 
 #### DLSSNR AI filter
 
-`DLSSNR_AI_Filter` is a same-resolution SDR post-process and does not upscale. It consumes the shared Frame Guidance group. The Effect exposes Style, Intensity, Local Tone, Local Structure, Automatic Mask, and Frame Guidance controls; NR Preset is fixed internally.
+`DLSSNR_AI_Filter` is a same-resolution post-process and does not upscale. It consumes the shared Frame Guidance group. Up to four passes each keep their own history. Every pass can set Style, Intensity, Local Tone, Local Structure, Skin, Preset, and Automatic Mask. Passes 2–4 inherit a setting when that control is −1. Pass feedback blends the previous answer into the next pass. A reduced processing resolution is rounded to a multiple of 16 pixels.
 
-Feature 18 uses the direct D3D12 exports of a locally supplied `nvngx_dlssnr.dll`; NGX Core only allocates and destroys the parameter block. The filter cannot separate UI already composited into the captured frame and may alter text/UI or produce ghosting and structural drift. HDR is not currently supported.
+Feature 18 uses the direct D3D12 exports of a locally supplied `nvngx_dlssnr.dll`; NGX Core only allocates and destroys the parameter block. The filter cannot separate UI already composited into the captured frame and may alter text/UI or produce ghosting and structural drift.
+
+| Control | Behaviour |
+| --- | --- |
+| Detail Reuse | Alternate frames skip the model. Saved detail moves with optical-flow motion, and gaps are filled from nearby detail so the reused frame does not flash back to the raw picture. |
+| ViT Reuse | `2` drops the ViT bottleneck on alternate frames. `1` computes it every frame. |
+| NVFP4 Hybrid | On RTX 50, replaces the eight FFN blocks with NVFP4. The other operators stay FP8. The files live in `DLSSNR-Hybrid` beside `Magpie.exe`. A source build that is missing that folder can fetch it with `tools/get_dlssnr_hybrid_assets.ps1`. |
+
+#### HDR capture and present
+
+An HDR desktop stores an SDR window as scRGB. Capturing that window as 8-bit clamps the range, so the colours are wrong before any effect runs. Graphics Capture requests `R16G16B16A16_FLOAT` when the desktop offers it, reads the SDR white level in nits, and converts to sRGB for the effect chain.
+
+A tearing swap chain then scans that 8-bit image as linear light on an HDR panel. While DLSS Frame Generation is presenting to an HDR display, the 8-bit image is handed to DWM, and DWM performs the SDR-to-HDR conversion for the desktop. The effect chain and the frame-generation backbuffer stay 8-bit sRGB. Paper white, colour curves, and `.cube` looks are not in this build.
 
 #### Frame Generation experiments
 
@@ -113,6 +125,12 @@ Approximate output frame rate:
 Choose the lowest multiplier that reaches the refresh rate at the lowest source frame rate you expect; higher multipliers only add skipped work. There is no switch for this behaviour. The startup log line reports the refresh rate, the present cap, and the multiplier; each per-second `DLSSFG presentation` line reports captured, submitted, and source FPS.
 
 Generated frames are presented back-to-back on a FLIP_SEQUENTIAL tearing swap chain with a maximum frame latency of 1; no sleep-based pacing or present queue sits in the frame path. While DLSS FG is active, the backend hands frames to the presenting thread through two alternating keyed-mutex shared textures, so publishing the next frame never waits for the previous one to be copied. NVIDIA Optical Flow uses the FAST preset and, for sources larger than 1280x720, runs at half resolution with the flow scaled back to source pixels; full-resolution MEDIUM flow cost several milliseconds per frame at 1440p and kept DLSS FG below the source frame rate.
+
+#### RTX 40 frame spacing and Dynamic Frame Generation
+
+`Ada Temporal Fix` applies on an RTX 40 GPU. It spaces the extra frames across the interval between two real frames, instead of leaving them all halfway between those frames, and raises an accepted warp blend to at least 0.85. RTX 50 already spaces those frames, and the patch leaves that GPU unchanged. The extra offline quality kernels are not in this build.
+
+`Dynamic Frame Generation` picks the multiplier from the monitor refresh rate, or from `Dynamic Target FPS` when that value is not zero. While it is on, the fixed multiplier is grayed. The refresh-rate budget above still drops a generated frame that would push output past the display. 5x and 6x are available on RTX 50, and on RTX 40 while Ada Temporal Fix is on. Other GPUs stop at 4x. A lower limit reported by the driver wins. Generated frames are shown on the capture path used by apps such as Elgato Studio.
 
 #### FSR 2.2.1
 
@@ -179,7 +197,7 @@ Third-party SDKs, models, wheels, and proprietary NVIDIA binaries are not part o
 
 To build the optional backends, create `src/BuildOptions.props.user` and define the feature switches and local SDK paths there. The file is excluded by `.gitignore`; it is machine-specific and must not be committed to the public repository. [Building with every optional backend](docs/BUILD_ALL_FEATURES.md) lists every switch with the tested dependency versions, download sources, required folder layouts, and an example file.
 
-The v1.9.2 AnyWindow source supports separate runtime-selection branches for RTX 20, RTX 30, RTX 40, and RTX 50. An external RTX 3090 field test confirmed that the RTX 30 branch starts and produces a visible processed result. The controller provides separately editable filter-toggle and floating-window visibility hotkeys, two-key combinations such as `Ctrl+A`, and an About page with GitHub updates and the project source link. The updater can replace the controller, matching external-window renderer, and DLSSNR effect with SHA-256 verification and rollback while preserving local settings, GPU runtimes, and models. Runtime/model DLLs remain local build inputs only: they are not included in this source tree or GitHub's automatically generated source archives. See the [v1.9.2 release notes](docs/RELEASE_NOTES_v1.9.2-full-auto-update.md) for the update flow and safety behavior.
+Version 1.10.0 keeps the RTX 20, RTX 30, RTX 40, and RTX 50 runtime branches from 1.9.2. The controller still has separate filter-toggle and floating-window hotkeys, two-key combinations such as `Ctrl+A`, and an About page. The updater checks [this fork](https://github.com/UncleTyrone/DLSS5-AnyWindow) and can replace the controller, the external-window renderer, and the DLSSNR effect with SHA-256 verification and rollback. Local settings, GPU runtimes, and models are left in place. Runtime and model DLLs stay local build inputs; they are not in this source tree. The behaviour above is the current one. See the [1.10.0 release notes](docs/RELEASE_NOTES_v1.10.0.md).
 
 Native upscalers and RTX Video are dispatched through the shared `NativeEffectBackend` interface and `NativeEffectBackendFactory`. This keeps SDK-specific detection, creation, resize, and draw logic out of the main Renderer path. Frame-generation presenters remain separate because they publish additional frames at the terminal presentation stage.
 
@@ -300,4 +318,4 @@ This project follows the [all-contributors](https://allcontributors.org/) specif
 
 ## License
 
-This project is licensed under GPLv3.
+This project is licensed under GPLv3. The RTX 40 midpoint frame-spacing correction is adapted from mavismmg's MIT-licensed MFGAdaUnlock-RenoDx; see `Licenses/MFGAdaUnlock-RenoDx-MIT.txt`. The RTX 50 NVFP4 hybrid is adapted from janblade's GPL-3.0 OptiScaler work; see `Licenses/janblade-OptiScaler-GPL-3.0.txt`.

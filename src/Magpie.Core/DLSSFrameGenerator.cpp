@@ -1,11 +1,13 @@
 #include "pch.h"
 #include "DLSSFrameGenerator.h"
+#include "DLSSGAdaUnlock.h"
 #include "DeviceResources.h"
 #include "FrameGuidanceD3D12Interop.h"
 #include "Logger.h"
 
 #ifdef MP_ENABLE_DLSS_FRAME_GENERATION
 #include <d3d12.h>
+#include <filesystem>
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers_dlssg.h>
 
@@ -249,6 +251,11 @@ bool DLSSFrameGenerator::Initialize(
 		IID_PPV_ARGS(impl->device12.put()));
 	if (FAILED(hr)) {
 		Logger::Get().ComError("Create DLSSFG D3D12 device failed", hr);
+		if (hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DEVICE_REMOVED ||
+			hr == DXGI_ERROR_DEVICE_RESET) {
+			Logger::Get().Error(
+				"The GPU is still hung from the last scaling session. Quit Magpie completely, then start it again.");
+		}
 		return false;
 	}
 
@@ -344,12 +351,24 @@ bool DLSSFrameGenerator::Initialize(
 	}
 	impl->commandList12->ResourceBarrier(2, auxBarriers);
 
+	if (!DLSSGAdaUnlock::Prepare(static_cast<DLSSGAdaUnlock::TemporalFix>(
+		_requestedSettings.adaTemporalFix))) {
+		return false;
+	}
+	wchar_t exePath[MAX_PATH]{};
+	GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+	const std::wstring applicationDirectory = std::filesystem::path(exePath).parent_path().wstring();
+	const wchar_t* featurePaths[] = { applicationDirectory.c_str() };
+	NVSDK_NGX_FeatureCommonInfo featureInfo{};
+	featureInfo.PathListInfo.Path = featurePaths;
+	featureInfo.PathListInfo.Length = 1;
 	NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
 		"7c134ab9-9677-4af5-a2b2-bca943350861",
 		NVSDK_NGX_ENGINE_TYPE_CUSTOM,
 		"Magpie-DLSSFG-1",
 		L"logs",
-		impl->device12.get()
+		impl->device12.get(),
+		&featureInfo
 	);
 	if (!NGXSucceeded(result)) {
 		Logger::Get().Error(fmt::format(

@@ -1,6 +1,8 @@
 #pragma once
 #include "NativeEffectBackend.h"
 
+struct NVSDK_NGX_Handle;
+
 namespace Magpie {
 
 class DeviceResources;
@@ -39,13 +41,35 @@ struct DLSSNRSettings {
 	float intensity = 1.0f;
 	float localToneStrength = 1.0f;
 	float localStructureStrength = 1.0f;
+	float skinStructureStrength = -1.0f;
+	int renderPreset = 0;
 	bool useAutoMask = false;
 	// 0 available/both, 1 force Zero, 2 motion only, 3 depth only.
 	int guidanceMode = 0;
 	uint32_t depthInferenceInterval = 4;
-	// Re-evaluate the same feature with the first pass output as the next input.
-	// This avoids creating a second NGX session, which the signed snippet rejects.
+	// Each pass has its own NGX feature and history. A later pass that the
+	// runtime refuses to create is skipped; earlier passes still run.
 	uint32_t passes = 1;
+	// Passes 2-4. -1 inherits the first pass. Local tone defaults to 0.
+	struct PassTune {
+		int style = -1;
+		float intensity = -1.0f;
+		float localToneStrength = 0.0f;
+		float localStructureStrength = -1.0f;
+		float skinStructureStrength = -1.0f;
+		int renderPreset = -1;
+	};
+	PassTune laterPass[3]{};
+	// 1 feeds the previous answer straight through. Lower values mix the
+	// previous input back in before the next pass.
+	float passFeedback = 1.0f;
+	// Off until checked. A reuse frame reapplies the last denoise detail with motion
+	// instead of running the model again.
+	bool detailReuse = false;
+	// 1 runs the ViT bottleneck every evaluation. 2 reuses it on the other frames.
+	uint32_t vitReuseInterval = 1;
+	// Non-zero asks for the RTX 50 NVFP4 hybrid. Without the pinned files the model stays on FP8.
+	int modelPrecision = 0;
 	// 0 adaptive: preserve history only when usable motion guidance is present.
 	// 1 static-stable: reset at the start of every source frame.
 	// 2 continuous: preserve history except for provider/resize/scene resets.
@@ -87,8 +111,13 @@ public:
 private:
 	bool _DrawOnce(
 		const NativeEffectDrawContext& context,
+		NVSDK_NGX_Handle* feature,
 		bool forceHistoryReset = false
 	) noexcept;
+
+	bool _EnsurePassFeature(uint32_t pass) noexcept;
+	DLSSNRSettings ResolvePassSettings(uint32_t pass) const noexcept;
+	const DLSSNRSettings* _activeSettings = nullptr;
 
 	std::unique_ptr<Impl> _impl;
 	DLSSNRSettings _settings;

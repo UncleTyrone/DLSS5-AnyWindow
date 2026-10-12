@@ -7,6 +7,7 @@
 #include "StrHelper.h"
 #include "Win32Helper.h"
 #include <dwmapi.h>
+#include <d3dcompiler.h>
 #include <Windows.Graphics.DirectX.Direct3D11.interop.h>
 
 namespace winrt {
@@ -17,6 +18,72 @@ using namespace Windows::Graphics::DirectX::Direct3D11;
 }
 
 namespace Magpie {
+
+static bool IsMonitorHdr(const DeviceResources& resources, HWND hwnd) noexcept {
+	const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	winrt::com_ptr<IDXGIAdapter1> adapter;
+	for (UINT adapterIndex = 0;
+		SUCCEEDED(resources.GetDXGIFactory()->EnumAdapters1(adapterIndex, adapter.put()));
+		++adapterIndex, adapter = nullptr) {
+		winrt::com_ptr<IDXGIOutput> output;
+		for (UINT outputIndex = 0;
+			SUCCEEDED(adapter->EnumOutputs(outputIndex, output.put()));
+			++outputIndex, output = nullptr) {
+			DXGI_OUTPUT_DESC desc{};
+			if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) {
+				continue;
+			}
+			winrt::com_ptr<IDXGIOutput6> output6 = output.try_as<IDXGIOutput6>();
+			DXGI_OUTPUT_DESC1 desc1{};
+			return output6 && SUCCEEDED(output6->GetDesc1(&desc1)) &&
+				desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+		}
+	}
+	return false;
+}
+
+static float QuerySdrWhiteScale(HWND hwnd) noexcept {
+	const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFOEXW info{ sizeof(info) };
+	if (!GetMonitorInfoW(monitor, &info)) {
+		return 1.0f;
+	}
+	UINT32 pathCount = 0;
+	UINT32 modeCount = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) {
+		return 1.0f;
+	}
+	std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+	std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+	if (QueryDisplayConfig(
+		QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS) {
+		return 1.0f;
+	}
+	paths.resize(pathCount);
+	for (const DISPLAYCONFIG_PATH_INFO& path : paths) {
+		DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+		source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+		source.header.size = sizeof(source);
+		source.header.adapterId = path.sourceInfo.adapterId;
+		source.header.id = path.sourceInfo.id;
+		if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) {
+			continue;
+		}
+		if (CompareStringOrdinal(source.viewGdiDeviceName, -1, info.szDevice, -1, TRUE) != CSTR_EQUAL) {
+			continue;
+		}
+		DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+		white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+		white.header.size = sizeof(white);
+		white.header.adapterId = path.targetInfo.adapterId;
+		white.header.id = path.targetInfo.id;
+		if (DisplayConfigGetDeviceInfo(&white.header) != ERROR_SUCCESS || white.SDRWhiteLevel == 0) {
+			return 1.0f;
+		}
+		return white.SDRWhiteLevel / 1000.0f;
+	}
+	return 1.0f;
+}
 
 bool GraphicsCaptureFrameSource::_Initialize() noexcept {
 	ID3D11Device5* d3dDevice = _deviceResources->GetD3DDevice();
@@ -63,10 +130,15 @@ bool GraphicsCaptureFrameSource::_Initialize() noexcept {
 		DXGI_FORMAT_B8G8R8A8_UNORM,
 		_frameBox.right - _frameBox.left,
 		_frameBox.bottom - _frameBox.top,
-		D3D11_BIND_SHADER_RESOURCE
+		D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET
 	);
 	if (!_output) {
 		Logger::Get().Error("创建纹理失败");
+		return false;
+	}
+	hr = d3dDevice->CreateRenderTargetView(_output.get(), nullptr, _outputRtv.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateRenderTargetView capture output failed", hr);
 		return false;
 	}
 
@@ -115,7 +187,14 @@ FrameSourceState GraphicsCaptureFrameSource::_Update() noexcept {
 		return FrameSourceState::Error;
 	}
 
-	_deviceResources->GetD3DDC()->CopySubresourceRegion(_output.get(), 0, 0, 0, 0, withFrame.get(), 0, &_frameBox);
+	D3D11_TEXTURE2D_DESC sourceDesc{};
+	withFrame->GetDesc(&sourceDesc);
+	if (_hdrScRgbCapture && sourceDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+		_ConvertScRgbToSrgb(withFrame.get());
+	} else {
+		_deviceResources->GetD3DDC()->CopySubresourceRegion(
+			_output.get(), 0, 0, 0, 0, withFrame.get(), 0, &_frameBox);
+	}
 
 	return FrameSourceState::NewFrame;
 }
@@ -321,13 +400,39 @@ bool GraphicsCaptureFrameSource::_StartCapture() noexcept {
 	}
 
 	try {
-		// 创建帧缓冲池。帧的尺寸和 _captureItem.Size() 不同
-		_captureFramePool = winrt::Direct3D11CaptureFramePool::Create(
-			_wrappedD3DDevice,
-			winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-			4,	// 帧的缓存数量，更大的值有利于在低帧率下降低延迟
-			{ (int)_frameBox.right, (int)_frameBox.bottom } // 帧的尺寸为包含源窗口的最小尺寸
-		);
+		// HDR desktops store SDR windows as scRGB. 8-bit capture clamps that
+		// and the picture comes back lifted. Float keeps the real values.
+		winrt::DirectXPixelFormat captureFormat =
+			winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized;
+		const HWND srcHwnd = ScalingWindow::Get().SrcTracker().Handle();
+		if (IsMonitorHdr(*_deviceResources, srcHwnd) && _EnsureScRgbConversion()) {
+			captureFormat = winrt::DirectXPixelFormat::R16G16B16A16Float;
+			_hdrScRgbCapture = true;
+			_invSdrWhiteScale = 1.0f / QuerySdrWhiteScale(srcHwnd);
+			Logger::Get().Info(fmt::format(
+				"Graphics Capture HDR: scRGB float, SDR white {:.0f} nits, converting to sRGB",
+				80.0f / _invSdrWhiteScale));
+		}
+		auto createPool = [&](winrt::DirectXPixelFormat format) {
+			return winrt::Direct3D11CaptureFramePool::Create(
+				_wrappedD3DDevice,
+				format,
+				4,
+				{ (int)_frameBox.right, (int)_frameBox.bottom }
+			);
+		};
+		try {
+			_captureFramePool = createPool(captureFormat);
+		} catch (const winrt::hresult_error& e) {
+			if (!_hdrScRgbCapture) {
+				throw;
+			}
+			Logger::Get().Info(StrHelper::Concat(
+				"scRGB capture unavailable, using 8-bit: ",
+				StrHelper::UTF16ToUTF8(e.message())));
+			_hdrScRgbCapture = false;
+			_captureFramePool = createPool(winrt::DirectXPixelFormat::B8G8R8A8UIntNormalized);
+		}
 
 		// 注册回调是为了确保每当有新的帧时会向当前线程发送消息，回调中什么也不做
 		_captureFramePool.FrameArrived([](const auto&, const auto&) {});
@@ -365,6 +470,171 @@ bool GraphicsCaptureFrameSource::_StartCapture() noexcept {
 	}
 
 	return true;
+}
+
+bool GraphicsCaptureFrameSource::_EnsureScRgbConversion() noexcept {
+	if (_scRgbPs) {
+		return true;
+	}
+
+	static constexpr char kHlsl[] = R"(
+struct VsOut {
+	float4 pos : SV_Position;
+};
+
+VsOut VSMain(uint id : SV_VertexID) {
+	VsOut o;
+	o.pos = float4(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0, 0.0, 1.0);
+	return o;
+}
+
+cbuffer Params : register(b0) {
+	uint offsetX;
+	uint offsetY;
+	float invWhiteScale;
+	float pad;
+};
+
+Texture2D<float4> source : register(t0);
+
+float3 LinearToSrgb(float3 c) {
+	c = saturate(c);
+	float3 low = c * 12.92;
+	float3 high = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+	return lerp(high, low, step(c, 0.0031308));
+}
+
+float4 PSMain(float4 pos : SV_Position) : SV_Target {
+	float3 scrgb = source.Load(int3(int(pos.x) + int(offsetX), int(pos.y) + int(offsetY), 0)).rgb;
+	return float4(LinearToSrgb(max(scrgb, 0) * invWhiteScale), 1);
+}
+)";
+
+	auto compile = [](const char* target, const char* entry, ID3DBlob** blob) {
+		winrt::com_ptr<ID3DBlob> errors;
+		const HRESULT hr = D3DCompile(
+			kHlsl, sizeof(kHlsl) - 1, "ScRgbToSrgb.hlsl", nullptr, nullptr,
+			entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, errors.put());
+		if (FAILED(hr)) {
+			Logger::Get().ComError(
+				errors ? (const char*)errors->GetBufferPointer() : "D3DCompile failed", hr);
+			return false;
+		}
+		return true;
+	};
+
+	winrt::com_ptr<ID3DBlob> vsBlob;
+	winrt::com_ptr<ID3DBlob> psBlob;
+	if (!compile("vs_5_0", "VSMain", vsBlob.put()) || !compile("ps_5_0", "PSMain", psBlob.put())) {
+		return false;
+	}
+
+	ID3D11Device* device = _deviceResources->GetD3DDevice();
+	HRESULT hr = device->CreateVertexShader(
+		vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, _scRgbVs.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateVertexShader failed", hr);
+		return false;
+	}
+	hr = device->CreatePixelShader(
+		psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, _scRgbPs.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreatePixelShader failed", hr);
+		return false;
+	}
+
+	D3D11_BUFFER_DESC cbDesc{
+		.ByteWidth = 16,
+		.Usage = D3D11_USAGE_DYNAMIC,
+		.BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+		.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE
+	};
+	hr = device->CreateBuffer(&cbDesc, nullptr, _scRgbCb.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateBuffer failed", hr);
+		return false;
+	}
+
+	D3D11_RASTERIZER_DESC rasterDesc{
+		.FillMode = D3D11_FILL_SOLID,
+		.CullMode = D3D11_CULL_NONE,
+		.DepthClipEnable = TRUE
+	};
+	hr = device->CreateRasterizerState(&rasterDesc, _scRgbRasterizer.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateRasterizerState failed", hr);
+		return false;
+	}
+	return true;
+}
+
+void GraphicsCaptureFrameSource::_ConvertScRgbToSrgb(ID3D11Texture2D* source) noexcept {
+	if (!_scRgbPs || !_outputRtv || !source) {
+		return;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	if (_sdrWhiteQueryTime.time_since_epoch().count() == 0 ||
+		now - _sdrWhiteQueryTime >= std::chrono::milliseconds(500)) {
+		_sdrWhiteQueryTime = now;
+		const float scale = QuerySdrWhiteScale(ScalingWindow::Get().SrcTracker().Handle());
+		if (scale > 0.0f) {
+			_invSdrWhiteScale = 1.0f / scale;
+		}
+	}
+
+	ID3D11Device* device = _deviceResources->GetD3DDevice();
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{
+		.Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+		.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+		.Texture2D = { .MipLevels = 1 }
+	};
+	if (FAILED(device->CreateShaderResourceView(source, &srvDesc, srv.put()))) {
+		return;
+	}
+
+	struct Params {
+		UINT offsetX;
+		UINT offsetY;
+		float invWhiteScale;
+		float pad;
+	} params{
+		.offsetX = _frameBox.left,
+		.offsetY = _frameBox.top,
+		.invWhiteScale = _invSdrWhiteScale
+	};
+
+	ID3D11DeviceContext4* dc = _deviceResources->GetD3DDC();
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	if (SUCCEEDED(dc->Map(_scRgbCb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		*static_cast<Params*>(mapped.pData) = params;
+		dc->Unmap(_scRgbCb.get(), 0);
+	}
+
+	const D3D11_VIEWPORT viewport{
+		.Width = float(_frameBox.right - _frameBox.left),
+		.Height = float(_frameBox.bottom - _frameBox.top),
+		.MaxDepth = 1.0f
+	};
+	dc->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+	ID3D11RenderTargetView* rtv = _outputRtv.get();
+	dc->OMSetRenderTargets(1, &rtv, nullptr);
+	dc->RSSetViewports(1, &viewport);
+	dc->RSSetState(_scRgbRasterizer.get());
+	dc->IASetInputLayout(nullptr);
+	dc->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	dc->VSSetShader(_scRgbVs.get(), nullptr, 0);
+	dc->PSSetShader(_scRgbPs.get(), nullptr, 0);
+	ID3D11Buffer* cb = _scRgbCb.get();
+	dc->PSSetConstantBuffers(0, 1, &cb);
+	ID3D11ShaderResourceView* bound = srv.get();
+	dc->PSSetShaderResources(0, 1, &bound);
+	dc->Draw(3, 0);
+
+	ID3D11ShaderResourceView* empty = nullptr;
+	dc->PSSetShaderResources(0, 1, &empty);
+	dc->OMSetRenderTargets(0, nullptr, nullptr);
 }
 
 void GraphicsCaptureFrameSource::_StopCapture() noexcept {

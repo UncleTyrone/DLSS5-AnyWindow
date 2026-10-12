@@ -19,6 +19,7 @@
 #include "TextureHelper.h"
 #include "Win32Helper.h"
 #include "DLSSFrameGenerator.h"
+#include "DLSSGAdaUnlock.h"
 #include "NativeEffectBackend.h"
 #include "NativeEffectBackendFactory.h"
 #include "NvidiaOpticalFlowProvider.h"
@@ -784,15 +785,28 @@ ID3D11Texture2D* Renderer::_BuildEffects() noexcept {
 				auto it = effects[i].parameters.find(std::string(name));
 				return it == effects[i].parameters.end() ? defaultValue : it->second;
 			};
+			const uint32_t adaTemporalFix = DLSSGAdaUnlock::IsAdaGpu() ? std::clamp(
+				(uint32_t)std::lround(getParameter("adaTemporalFix", 1.0f)),
+				0u, 1u) : 0u;
+			const uint32_t maxMultiplier = DLSSGAdaUnlock::MaxMultiplier(adaTemporalFix != 0);
 			dlssFrameGenerationSettings = DLSSFrameGenerationSettings{
 				.multiplier = std::clamp(
 					(uint32_t)std::lround(getParameter("multiplier", 2.0f)),
-					2u, 6u),
+					2u, maxMultiplier),
 				.useMotionVectors =
 					getParameter("useMotionVectors", 1.0f) >= 0.5f,
 				.useEstimatedDepth =
-					getParameter("useEstimatedDepth", 0.0f) >= 0.5f
+					getParameter("useEstimatedDepth", 0.0f) >= 0.5f,
+				.adaTemporalFix = adaTemporalFix
 			};
+			_dlssFgDynamic = getParameter("dynamicMfg", 0.0f) >= 0.5f;
+			_dlssFgDynamicTarget = std::clamp(getParameter("dynamicTargetFps", 0.0f), 0.0f, 1000.0f);
+			if (_dlssFgDynamic) {
+				dlssFrameGenerationSettings->multiplier = maxMultiplier;
+				Logger::Get().Info(fmt::format(
+					"DLSSFG dynamic frame generation is on; the fixed multiplier is ignored, up to {}x",
+					maxMultiplier));
+			}
 		}
 
 		// 释放 CSO 内存，不再需要它们
@@ -1738,27 +1752,48 @@ uint32_t Renderer::_NextDLSSFrameGenerationCount() noexcept {
 		_dlssFgRateWindowFrames = 0;
 	}
 
-	// Always generate the selected multiplier. Rate estimates lag the game
-	// and let output sag to 220; instead drop only the generated frames that
-	// would exceed refresh-1, using the real time since the last frame.
+	// Fixed mode always asks for the selected multiplier. Dynamic mode asks
+	// for enough generated frames to fill the refresh from the rate this
+	// loop actually consumes real frames. The capture source rate is faster
+	// than that whenever DLSSNR (or anything else) slows the loop, and using
+	// it left dynamic stuck at 3x while 6x still presented ~200 FPS.
 	const double presentHz = std::max(double(_dlssFgRefreshHz) - 1.0, 1.0);
 	const double budgetCap = maxGenerated + 2.0;
+	double frameDt = 0.0;
 	if (_dlssFgBudgetTime.time_since_epoch().count() == 0) {
 		_dlssFgPresentBudget = maxGenerated + 1.0;
 	} else {
-		const double dt = std::chrono::duration<double>(now - _dlssFgBudgetTime).count();
-		_dlssFgPresentBudget = dt > 0.0 && dt < 0.05 ?
-			std::min(_dlssFgPresentBudget + dt * presentHz, budgetCap) :
+		frameDt = std::chrono::duration<double>(now - _dlssFgBudgetTime).count();
+		_dlssFgPresentBudget = frameDt > 0.0 && frameDt < 0.080 ?
+			std::min(_dlssFgPresentBudget + frameDt * presentHz, budgetCap) :
 			maxGenerated + 1.0;
 	}
 	_dlssFgBudgetTime = now;
 
 	uint32_t count = uint32_t(maxGenerated);
+	if (_dlssFgDynamic && frameDt >= 0.004 && frameDt <= 0.080) {
+		const double target = _dlssFgDynamicTarget > 1.0f ?
+			double(_dlssFgDynamicTarget) : presentHz;
+		const double instant = 1.0 / frameDt;
+		_dlssFgDynamicEma = _dlssFgDynamicEma <= 1.0 ? instant
+			: _dlssFgDynamicEma * 0.7 + instant * 0.3;
+		const uint32_t desired = uint32_t(std::clamp(
+			std::ceil(target / _dlssFgDynamicEma) - 1.0, 0.0, maxGenerated));
+		if (_dlssFgDynamicCount == 0 || desired > _dlssFgDynamicCount) {
+			_dlssFgDynamicCount = desired;
+			_dlssFgDynamicStep = now;
+		} else if (desired < _dlssFgDynamicCount &&
+			now - _dlssFgDynamicStep >= std::chrono::milliseconds(400)) {
+			_dlssFgDynamicCount = desired;
+			_dlssFgDynamicStep = now;
+		}
+		count = _dlssFgDynamicCount;
+	}
 	while (count > 0 && _dlssFgPresentBudget < double(count) + 1.0) {
 		--count;
 	}
 	_dlssFgPresentBudget -= double(count) + 1.0;
-	_dlssFgGenerated = maxGenerated;
+	_dlssFgGenerated = count;
 	return count;
 }
 

@@ -33,19 +33,19 @@ constexpr wchar_t INSTANCE_MUTEX[] = L"Local\\DLSS5DoubleFloatingController.Sing
 constexpr wchar_t INSTANCE_MUTEX_QA[] = L"Local\\DLSS5DoubleFloatingController.PixelQaInstance";
 constexpr wchar_t ENGINE_NAME[] = L"DLSSNRWindowDouble.exe";
 constexpr wchar_t SETTINGS_FILE[] = L"DLSS5-settings.ini";
-constexpr wchar_t APP_VERSION[] = L"1.9.2";
+constexpr wchar_t APP_VERSION[] = L"1.10.0";
 constexpr int APP_VERSION_MAJOR = 1;
-constexpr int APP_VERSION_MINOR = 9;
-constexpr int APP_VERSION_PATCH = 2;
+constexpr int APP_VERSION_MINOR = 10;
+constexpr int APP_VERSION_PATCH = 0;
 constexpr wchar_t GITHUB_REPOSITORY_URL[] =
-	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow";
+	L"https://github.com/UncleTyrone/DLSS5-AnyWindow-FG-Elgato-Fix";
 constexpr wchar_t GITHUB_RELEASES_API[] =
-	L"https://api.github.com/repos/Shangyuwang11/DLSS5-AnyWindow/releases?per_page=20";
+	L"https://api.github.com/repos/UncleTyrone/DLSS5-AnyWindow-FG-Elgato-Fix/releases?per_page=20";
 constexpr wchar_t COMPONENT_UPDATE_BASE_URL[] =
-	L"https://github.com/Shangyuwang11/DLSS5-AnyWindow/releases/download/"
-	L"v1.9.2-dlss5-anywindow/";
-constexpr wchar_t RENDERER_UPDATE_ASSET[] = L"DLSSNRWindowDouble-1.9.2.exe";
-constexpr wchar_t EFFECT_UPDATE_ASSET[] = L"DLSSNR_AI_Filter-1.9.2.hlsl";
+	L"https://github.com/UncleTyrone/DLSS5-AnyWindow-FG-Elgato-Fix/releases/download/"
+	L"v1.10.0-dlss5-anywindow/";
+constexpr wchar_t RENDERER_UPDATE_ASSET[] = L"DLSSNRWindowDouble-1.10.0.exe";
+constexpr wchar_t EFFECT_UPDATE_ASSET[] = L"DLSSNR_AI_Filter-1.10.0.hlsl";
 constexpr wchar_t RENDERER_SHA256[] =
 	L"1c9de16142c177ec05e19edfb69a1292cb4a1797458656acba0027e8d0762674";
 constexpr wchar_t EFFECT_SHA256[] =
@@ -633,7 +633,7 @@ bool HttpGet(
 	if (resource.empty()) resource = L"/";
 
 	HINTERNET session = WinHttpOpen(
-		L"DLSS5-AnyWindow-Updater/1.9.2",
+		L"DLSS5-AnyWindow-Updater/1.10.0",
 		WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
 		WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!session) {

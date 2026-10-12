@@ -4,6 +4,7 @@
 #include "Logger.h"
 #include "ScalingWindow.h"
 #include "Win32Helper.h"
+#include <d3dcompiler.h>
 
 namespace Magpie {
 
@@ -29,6 +30,11 @@ bool AdaptivePresenter::_Initialize(HWND hwndAttach) noexcept {
 	}
 
 	const SIZE rendererSize = Win32Helper::GetSizeOfRect(ScalingWindow::Get().RendererRect());
+	// Direct flip scans 8-bit sRGB out as linear light on an HDR panel. scRGB and
+	// HDR10 presents did the same on this driver. Hand the 8-bit image to DWM.
+	const bool hdrOutput = useDlssFgSwapChain && _IsAttachedOutputHdr(hwndAttach);
+	const bool dwmSwapChain = hdrOutput && _EnsureHdrBlitPipeline() &&
+		_TryCreateDwmSwapChain(hwndAttach, bufferCount, rendererSize);
 	DXGI_SWAP_CHAIN_DESC1 sd{
 		.Width = (UINT)rendererSize.cx,
 		.Height = (UINT)rendererSize.cy,
@@ -59,33 +65,49 @@ bool AdaptivePresenter::_Initialize(HWND hwndAttach) noexcept {
 
 	ID3D11Device5* d3dDevice = _deviceResources->GetD3DDevice();
 	winrt::com_ptr<IDXGISwapChain1> dxgiSwapChain;
-	HRESULT hr = _deviceResources->GetDXGIFactory()->CreateSwapChainForHwnd(
-		d3dDevice,
-		hwndAttach,
-		&sd,
-		nullptr,
-		nullptr,
-		dxgiSwapChain.put()
-	);
-	if (FAILED(hr)) {
-		Logger::Get().ComError("创建交换链失败", hr);
-		return false;
-	}
+	HRESULT hr = S_OK;
+	if (!dwmSwapChain) {
+		hr = _deviceResources->GetDXGIFactory()->CreateSwapChainForHwnd(
+			d3dDevice,
+			hwndAttach,
+			&sd,
+			nullptr,
+			nullptr,
+			dxgiSwapChain.put()
+		);
+		if (FAILED(hr)) {
+			Logger::Get().ComError("创建交换链失败", hr);
+			return false;
+		}
 
-	_dxgiSwapChain = dxgiSwapChain.try_as<IDXGISwapChain4>();
-	if (!_dxgiSwapChain) {
-		Logger::Get().Error("获取 IDXGISwapChain2 失败");
-		return false;
+		_dxgiSwapChain = dxgiSwapChain.try_as<IDXGISwapChain4>();
+		if (!_dxgiSwapChain) {
+			Logger::Get().Error("获取 IDXGISwapChain2 失败");
+			return false;
+		}
 	}
 
 	uint32_t maximumFrameLatency = bufferCount - 1;
 	if (useDlssFgSwapChain) {
 		maximumFrameLatency = 1;
-		_useTearingPresent = _deviceResources->IsTearingSupported();
+		if (!dwmSwapChain) {
+			_useTearingPresent = _deviceResources->IsTearingSupported();
+		}
 	}
 	// DLSSFG submits multiple output frames for each captured frame. Restrict
 	// its swap-chain queue to one frame so presentation cannot add another
 	// multi-frame latency queue; other effects retain the original behavior.
+	if (hdrOutput && !dwmSwapChain) {
+		_useTearingPresent = false;
+		UINT colorSpaceSupport = 0;
+		if (SUCCEEDED(_dxgiSwapChain->CheckColorSpaceSupport(
+			DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &colorSpaceSupport)) &&
+			(colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+			_dxgiSwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+		}
+		Logger::Get().Info("DLSSFG HDR display is presenting 8-bit without tearing");
+	}
+
 	_dxgiSwapChain->SetMaximumFrameLatency(maximumFrameLatency);
 	if (maximumFrameLatency == 1) {
 		Logger::Get().Info(fmt::format(
@@ -146,8 +168,8 @@ bool AdaptivePresenter::BeginFrame(
 			_isframeLatencyWaited = true;
 		}
 
-		frameTex = _backBuffer;
-		frameRtv = _backBufferRtv;
+		frameTex = _hdrScanout ? _composeTex : _backBuffer;
+		frameRtv = _hdrScanout ? _composeRtv : _backBufferRtv;
 	}
 	
 	return true;
@@ -156,6 +178,8 @@ bool AdaptivePresenter::BeginFrame(
 void AdaptivePresenter::EndFrame(bool waitForGpu) noexcept {
 	if (_isDCompPresenting) {
 		_dcompSurface->EndDraw();
+	} else if (_hdrScanout) {
+		_BlitSdrToHdr();
 	}
 
 	if (waitForGpu || _isResized) {
@@ -195,6 +219,9 @@ void AdaptivePresenter::EndFrame(bool waitForGpu) noexcept {
 			presentHr = _dxgiSwapChain->Present(0, 0);
 		}
 		_isframeLatencyWaited = false;
+		if (_compositionSwapChain) {
+			_dcompDevice->Commit();
+		}
 
 		// 丢弃渲染目标的内容
 		_deviceResources->GetD3DDC()->DiscardView(_backBufferRtv.get());
@@ -206,8 +233,8 @@ void AdaptivePresenter::EndFrame(bool waitForGpu) noexcept {
 			_WaitForGpu();
 			Win32Helper::WaitForDwmComposition();
 
-			// 清除 DirectCompostion 内容
-			_dcompVisual->SetContent(nullptr);
+			// A composition swap chain is only visible through its visual.
+			_dcompVisual->SetContent(_compositionSwapChain ? _dxgiSwapChain.get() : nullptr);
 			_dcompDevice->Commit();
 		}
 	}
@@ -292,6 +319,11 @@ bool AdaptivePresenter::_ResizeSwapChain() noexcept {
 		return false;
 	}
 
+	if (_hdrScanout && !_EnsureComposeTarget((UINT)swapChainSize.cx, (UINT)swapChainSize.cy)) {
+		Logger::Get().Error("_EnsureComposeTarget 失败");
+		return false;
+	}
+
 	return true;
 }
 
@@ -362,6 +394,349 @@ bool AdaptivePresenter::_ResizeDCompVisual(HWND hwndAttach) noexcept {
 	}
 
 	return true;
+}
+
+bool AdaptivePresenter::_TryCreateDwmSwapChain(HWND hwnd, uint32_t bufferCount, SIZE size) noexcept {
+	DXGI_SWAP_CHAIN_DESC1 sd{
+		.Width = (UINT)size.cx,
+		.Height = (UINT)size.cy,
+		.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+		.SampleDesc = { .Count = 1 },
+		.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+		.BufferCount = bufferCount,
+		.Scaling = DXGI_SCALING_STRETCH,
+		.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+		.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED,
+		.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+	};
+
+	winrt::com_ptr<IDXGISwapChain1> swapChain;
+	HRESULT hr = _deviceResources->GetDXGIFactory()->CreateSwapChainForComposition(
+		_deviceResources->GetD3DDevice(), &sd, nullptr, swapChain.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateSwapChainForComposition failed", hr);
+		return false;
+	}
+	_dxgiSwapChain = swapChain.try_as<IDXGISwapChain4>();
+	if (!_dxgiSwapChain) {
+		Logger::Get().Error("获取 IDXGISwapChain4 失败");
+		return false;
+	}
+
+	UINT colorSpaceSupport = 0;
+	if (SUCCEEDED(_dxgiSwapChain->CheckColorSpaceSupport(
+		DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &colorSpaceSupport)) &&
+		(colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+		hr = _dxgiSwapChain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+		if (FAILED(hr)) {
+			Logger::Get().ComError("SetColorSpace1 sRGB failed", hr);
+		}
+	}
+
+	auto fail = [this]() {
+		_dcompVisual = nullptr;
+		_dcompTarget = nullptr;
+		_dcompDevice = nullptr;
+		_dxgiSwapChain = nullptr;
+		_compositionSwapChain = false;
+		_hdrScanout = false;
+		return false;
+	};
+
+	hr = DCompositionCreateDevice3(
+		_deviceResources->GetD3DDevice(), IID_PPV_ARGS(_dcompDevice.put()));
+	if (FAILED(hr)) {
+		Logger::Get().ComError("DCompositionCreateDevice3 failed", hr);
+		return fail();
+	}
+	hr = _dcompDevice->CreateTargetForHwnd(hwnd, TRUE, _dcompTarget.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateTargetForHwnd failed", hr);
+		return fail();
+	}
+	hr = _dcompDevice->CreateVisual(_dcompVisual.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateVisual failed", hr);
+		return fail();
+	}
+	hr = _dcompVisual->SetContent(_dxgiSwapChain.get());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("SetContent failed", hr);
+		return fail();
+	}
+	hr = _dcompTarget->SetRoot(_dcompVisual.get());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("SetRoot failed", hr);
+		return fail();
+	}
+	hr = _dcompDevice->Commit();
+	if (FAILED(hr)) {
+		Logger::Get().ComError("Commit failed", hr);
+		return fail();
+	}
+	if (!_EnsureComposeTarget(sd.Width, sd.Height)) {
+		return fail();
+	}
+
+	_compositionSwapChain = true;
+	_hdrScanout = true;
+	_useTearingPresent = false;
+	Logger::Get().Info("DLSSFG HDR display is 8-bit sRGB through DWM");
+	return true;
+}
+
+bool AdaptivePresenter::_IsAttachedOutputHdr(HWND hwnd) noexcept {
+	const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	winrt::com_ptr<IDXGIAdapter1> adapter;
+	for (UINT adapterIndex = 0;
+		SUCCEEDED(_deviceResources->GetDXGIFactory()->EnumAdapters1(adapterIndex, adapter.put()));
+		++adapterIndex, adapter = nullptr) {
+		winrt::com_ptr<IDXGIOutput> output;
+		for (UINT outputIndex = 0;
+			SUCCEEDED(adapter->EnumOutputs(outputIndex, output.put()));
+			++outputIndex, output = nullptr) {
+			DXGI_OUTPUT_DESC desc{};
+			if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) {
+				continue;
+			}
+			winrt::com_ptr<IDXGIOutput6> output6 = output.try_as<IDXGIOutput6>();
+			DXGI_OUTPUT_DESC1 desc1{};
+			return output6 && SUCCEEDED(output6->GetDesc1(&desc1)) &&
+				desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+		}
+	}
+	return false;
+}
+
+float AdaptivePresenter::_QuerySdrWhiteScale(HWND hwnd) noexcept {
+	const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFOEXW info{ sizeof(info) };
+	if (!GetMonitorInfoW(monitor, &info)) {
+		return 1.0f;
+	}
+
+	UINT32 pathCount = 0;
+	UINT32 modeCount = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) {
+		return 1.0f;
+	}
+	std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+	std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+	if (QueryDisplayConfig(
+		QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS) {
+		return 1.0f;
+	}
+	paths.resize(pathCount);
+
+	for (const DISPLAYCONFIG_PATH_INFO& path : paths) {
+		DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+		source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+		source.header.size = sizeof(source);
+		source.header.adapterId = path.sourceInfo.adapterId;
+		source.header.id = path.sourceInfo.id;
+		if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) {
+			continue;
+		}
+		if (CompareStringOrdinal(source.viewGdiDeviceName, -1, info.szDevice, -1, TRUE) != CSTR_EQUAL) {
+			continue;
+		}
+
+		DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+		white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+		white.header.size = sizeof(white);
+		white.header.adapterId = path.targetInfo.adapterId;
+		white.header.id = path.targetInfo.id;
+		if (DisplayConfigGetDeviceInfo(&white.header) != ERROR_SUCCESS || white.SDRWhiteLevel == 0) {
+			return 1.0f;
+		}
+		return white.SDRWhiteLevel / 1000.0f;
+	}
+	return 1.0f;
+}
+
+bool AdaptivePresenter::_EnsureHdrBlitPipeline() noexcept {
+	if (_hdrPs) {
+		return true;
+	}
+
+	static constexpr char kHlsl[] = R"(
+struct VsOut {
+	float4 pos : SV_Position;
+};
+
+VsOut VSMain(uint id : SV_VertexID) {
+	VsOut o;
+	o.pos = float4(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0, 0.0, 1.0);
+	return o;
+}
+
+Texture2D<float4> source : register(t0);
+
+float4 PSMain(float4 pos : SV_Position) : SV_Target {
+	// Composition requires premultiplied alpha. Captured alpha is often 0,
+	// which would blend the picture with the HDR desktop and wash it out.
+	return float4(source.Load(int3(pos.xy, 0)).rgb, 1);
+}
+)";
+
+	auto compile = [](const char* target, const char* entry, ID3DBlob** blob) {
+		winrt::com_ptr<ID3DBlob> errors;
+		const HRESULT hr = D3DCompile(
+			kHlsl, sizeof(kHlsl) - 1, "HdrSdrBlit.hlsl", nullptr, nullptr,
+			entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, errors.put());
+		if (FAILED(hr)) {
+			Logger::Get().ComError(
+				errors ? (const char*)errors->GetBufferPointer() : "D3DCompile failed", hr);
+			return false;
+		}
+		return true;
+	};
+
+	winrt::com_ptr<ID3DBlob> vsBlob;
+	winrt::com_ptr<ID3DBlob> psBlob;
+	if (!compile("vs_5_0", "VSMain", vsBlob.put()) || !compile("ps_5_0", "PSMain", psBlob.put())) {
+		return false;
+	}
+
+	ID3D11Device* device = _deviceResources->GetD3DDevice();
+	HRESULT hr = device->CreateVertexShader(
+		vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, _hdrVs.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateVertexShader failed", hr);
+		return false;
+	}
+	hr = device->CreatePixelShader(
+		psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, _hdrPs.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreatePixelShader failed", hr);
+		return false;
+	}
+
+	D3D11_BUFFER_DESC cbDesc{
+		.ByteWidth = 16,
+		.Usage = D3D11_USAGE_DYNAMIC,
+		.BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+		.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE
+	};
+	hr = device->CreateBuffer(&cbDesc, nullptr, _hdrCb.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateBuffer failed", hr);
+		return false;
+	}
+
+	D3D11_RASTERIZER_DESC rasterDesc{
+		.FillMode = D3D11_FILL_SOLID,
+		.CullMode = D3D11_CULL_NONE,
+		.DepthClipEnable = TRUE
+	};
+	hr = device->CreateRasterizerState(&rasterDesc, _hdrRasterizer.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateRasterizerState failed", hr);
+		return false;
+	}
+	return true;
+}
+
+bool AdaptivePresenter::_EnsureComposeTarget(UINT width, UINT height) noexcept {
+	if (_composeTex) {
+		D3D11_TEXTURE2D_DESC existing{};
+		_composeTex->GetDesc(&existing);
+		if (existing.Width == width && existing.Height == height) {
+			return true;
+		}
+	}
+
+	_composeSrv = nullptr;
+	_composeRtv = nullptr;
+	_composeTex = nullptr;
+
+	D3D11_TEXTURE2D_DESC desc{
+		.Width = width,
+		.Height = height,
+		.MipLevels = 1,
+		.ArraySize = 1,
+		.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+		.SampleDesc = { .Count = 1 },
+		.Usage = D3D11_USAGE_DEFAULT,
+		.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE
+	};
+	ID3D11Device* device = _deviceResources->GetD3DDevice();
+	HRESULT hr = device->CreateTexture2D(&desc, nullptr, _composeTex.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateTexture2D compose target failed", hr);
+		return false;
+	}
+	hr = device->CreateRenderTargetView(_composeTex.get(), nullptr, _composeRtv.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateRenderTargetView compose target failed", hr);
+		return false;
+	}
+	hr = device->CreateShaderResourceView(_composeTex.get(), nullptr, _composeSrv.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError("CreateShaderResourceView compose target failed", hr);
+		return false;
+	}
+	return true;
+}
+
+void AdaptivePresenter::_BlitSdrToHdr() noexcept {
+	if (!_composeSrv || !_hdrPs || !_backBufferRtv) {
+		return;
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	if (_sdrWhiteQueryTime.time_since_epoch().count() == 0 ||
+		now - _sdrWhiteQueryTime >= std::chrono::milliseconds(500)) {
+		_sdrWhiteQueryTime = now;
+		HWND hwnd = nullptr;
+		if (FAILED(_dxgiSwapChain->GetHwnd(&hwnd))) {
+			hwnd = nullptr;
+		}
+		const float scale = _QuerySdrWhiteScale(hwnd);
+		if (scale > 0.0f) {
+			_sdrWhiteScale = scale;
+		}
+	}
+
+	ID3D11DeviceContext4* dc = _deviceResources->GetD3DDC();
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	if (SUCCEEDED(dc->Map(_hdrCb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		*static_cast<float*>(mapped.pData) = _sdrWhiteScale * 80.0f;
+		dc->Unmap(_hdrCb.get(), 0);
+	}
+
+	D3D11_TEXTURE2D_DESC desc{};
+	_backBuffer->GetDesc(&desc);
+	const D3D11_VIEWPORT viewport{
+		.Width = float(desc.Width),
+		.Height = float(desc.Height),
+		.MaxDepth = 1.0f
+	};
+
+	// The cursor leaves premultiplied blending bound (dest *= srcAlpha, then
+	// add). This pass writes alpha 1, so that blend adds every present onto the
+	// FLIP_SEQUENTIAL float buffer until the image burns out.
+	dc->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+	dc->OMSetRenderTargets(0, nullptr, nullptr);
+	ID3D11RenderTargetView* rtv = _backBufferRtv.get();
+	dc->OMSetRenderTargets(1, &rtv, nullptr);
+	constexpr float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	dc->ClearRenderTargetView(rtv, black);
+	dc->RSSetViewports(1, &viewport);
+	dc->RSSetState(_hdrRasterizer.get());
+	dc->IASetInputLayout(nullptr);
+	dc->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	dc->VSSetShader(_hdrVs.get(), nullptr, 0);
+	dc->PSSetShader(_hdrPs.get(), nullptr, 0);
+	ID3D11Buffer* cb = _hdrCb.get();
+	dc->PSSetConstantBuffers(0, 1, &cb);
+	ID3D11ShaderResourceView* srv = _composeSrv.get();
+	dc->PSSetShaderResources(0, 1, &srv);
+	dc->Draw(3, 0);
+
+	ID3D11ShaderResourceView* empty = nullptr;
+	dc->PSSetShaderResources(0, 1, &empty);
+	dc->OMSetRenderTargets(0, nullptr, nullptr);
 }
 
 }
