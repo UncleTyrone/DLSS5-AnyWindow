@@ -51,9 +51,9 @@ bool AdaptivePresenter::_Initialize(HWND hwndAttach) noexcept {
 		// 如果两种渲染方式无法无缝切换，DXGI_SCALING_STRETCH 使视觉变化尽可能小
 		.Scaling = DXGI_SCALING_STRETCH,
 #endif
-		// FLIP_DISCARD + Present(0) drops unread interpolations, so Elgato only
-		// sees the latest real frame. FLIP_SEQUENTIAL keeps each generated frame
-		// until scanout. The queue stays one frame (latency 1).
+		// FLIP_DISCARD + Present(0) drops unread interpolations, so a capture of
+		// scanout only sees the latest real frame. FLIP_SEQUENTIAL keeps each
+		// generated frame until scanout. The queue stays one frame (latency 1).
 		.SwapEffect = useDlssFgSwapChain
 			? DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
 			: DXGI_SWAP_EFFECT_FLIP_DISCARD,

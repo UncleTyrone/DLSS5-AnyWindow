@@ -130,7 +130,7 @@ Generated frames are presented back-to-back on a FLIP_SEQUENTIAL tearing swap ch
 
 `Ada Temporal Fix` applies on an RTX 40 GPU. It spaces the extra frames across the interval between two real frames, instead of leaving them all halfway between those frames, and raises an accepted warp blend to at least 0.85. RTX 50 already spaces those frames, and the patch leaves that GPU unchanged. The extra offline quality kernels are not in this build.
 
-`Dynamic Frame Generation` picks the multiplier from the monitor refresh rate, or from `Dynamic Target FPS` when that value is not zero. While it is on, the fixed multiplier is grayed. The refresh-rate budget above still drops a generated frame that would push output past the display. 5x and 6x are available on RTX 50, and on RTX 40 while Ada Temporal Fix is on. Other GPUs stop at 4x. A lower limit reported by the driver wins. Generated frames are shown on the capture path used by apps such as Elgato Studio.
+`Dynamic Frame Generation` picks the multiplier from the monitor refresh rate, or from `Dynamic Target FPS` when that value is not zero. While it is on, the fixed multiplier is grayed. The refresh-rate budget above still drops a generated frame that would push output past the display. 5x and 6x are available on RTX 50, and on RTX 40 while Ada Temporal Fix is on. Other GPUs stop at 4x. A lower limit reported by the driver wins.
 
 #### FSR 2.2.1
 

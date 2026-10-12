@@ -38,11 +38,11 @@ constexpr int APP_VERSION_MAJOR = 1;
 constexpr int APP_VERSION_MINOR = 10;
 constexpr int APP_VERSION_PATCH = 0;
 constexpr wchar_t GITHUB_REPOSITORY_URL[] =
-	L"https://github.com/UncleTyrone/DLSS5-AnyWindow-FG-Elgato-Fix";
+	L"https://github.com/UncleTyrone/DLSS5-AnyWindow";
 constexpr wchar_t GITHUB_RELEASES_API[] =
-	L"https://api.github.com/repos/UncleTyrone/DLSS5-AnyWindow-FG-Elgato-Fix/releases?per_page=20";
+	L"https://api.github.com/repos/UncleTyrone/DLSS5-AnyWindow/releases?per_page=20";
 constexpr wchar_t COMPONENT_UPDATE_BASE_URL[] =
-	L"https://github.com/UncleTyrone/DLSS5-AnyWindow-FG-Elgato-Fix/releases/download/"
+	L"https://github.com/UncleTyrone/DLSS5-AnyWindow/releases/download/"
 	L"v1.10.0-dlss5-anywindow/";
 constexpr wchar_t RENDERER_UPDATE_ASSET[] = L"DLSSNRWindowDouble-1.10.0.exe";
 constexpr wchar_t EFFECT_UPDATE_ASSET[] = L"DLSSNR_AI_Filter-1.10.0.hlsl";

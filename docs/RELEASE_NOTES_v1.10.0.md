@@ -18,7 +18,7 @@
 
 ## 用户可见变化
 
-- **DLSS 帧生成，2x 到 6x。** 输出停在缩放窗口所在显示器的刷新率，不会超过。每张真实帧都按所选倍率请求；会使输出超过刷新率的生成帧被跳过。生成帧进入 Elgato Studio 等采集应用能看到的呈现路径。
+- **DLSS 帧生成，2x 到 6x。** 输出停在缩放窗口所在显示器的刷新率，不会超过。每张真实帧都按所选倍率请求；会使输出超过刷新率的生成帧被跳过。生成帧在 FLIP_SEQUENTIAL、允许撕裂、最大帧延迟为 1 的交换链上连续呈现，每一帧都会保留到扫描输出。
 - **动态帧生成。** 按刷新率或你设定的帧率选择倍率。开启时固定倍率变灰。刷新率预算仍然是上限。
 - **RTX 40 多帧生成。** 打开 Ada 时序修复后，3x 到 6x 把额外帧均匀排进两帧真实画面之间，并把已接受的混合权重抬到至少 0.85。RTX 50 本身支持这些倍率，补丁不会改动它。离线质量内核还不在这个版本里。其他 GPU 最高到 4x。驱动报告的更低上限优先。
 - **DLSS 神经渲染。** 同分辨率滤镜。标准、自然、电影三种风格。最多 4 次处理，每一次有自己的风格、强度、结构、色调、皮肤和预设；后几次可以继承第一次。隔帧可以复用细节。ViT 复用设为 2 时隔帧跳过瓶颈，设为 1 时每帧都计算。
@@ -67,7 +67,7 @@
 
 DLSS5 AnyWindow 1.10.0 is this fork's release on top of [Shangyuwang11/DLSS5-AnyWindow](https://github.com/Shangyuwang11/DLSS5-AnyWindow). Versions 1.5.0 through 1.9.2, linked above, cover runtime selection, the floating controller, and the updater. This note covers frame generation and DLSSNR in the same order as the upstream README.
 
-- **DLSS Frame Generation, 2x through 6x.** Output stays on the refresh rate of the monitor showing the scaled window. Every real frame asks for the selected multiplier. Generated frames that would pass that rate are skipped. They are presented where capture apps such as Elgato Studio can see them.
+- **DLSS Frame Generation, 2x through 6x.** Output stays on the refresh rate of the monitor showing the scaled window. Every real frame asks for the selected multiplier. Generated frames that would pass that rate are skipped. They are presented back-to-back on a FLIP_SEQUENTIAL tearing swap chain with a maximum frame latency of 1, so each generated frame stays until scanout.
 - **Dynamic Frame Generation.** The multiplier follows the refresh rate, or a frame rate you set. While it is on, the fixed multiplier is grayed. The refresh-rate budget remains the ceiling.
 - **RTX 40 multi-frame generation.** With Ada Temporal Fix on, 3x through 6x space the extra frames across the interval and raise an accepted warp blend to at least 0.85. RTX 50 already supports these multipliers, and the patch leaves that GPU unchanged. The extra offline quality kernels are not in this build. Other GPUs stop at 4x. A lower limit from the driver wins.
 - **DLSS Neural Rendering.** Same-resolution filter. Standard, Natural, and Cinematic styles. Up to four passes, each with its own style, strength, structure, tone, skin, and preset. Later passes can inherit the first. Detail can be reused on alternate frames. ViT reuse at 2 skips the bottleneck on alternate frames; 1 computes it every frame.
