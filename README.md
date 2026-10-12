@@ -72,15 +72,27 @@ Creating a dedicated Magpie application profile in NVIDIA Profile Inspector is r
 
 #### DLSSNR AI filter
 
-`DLSSNR_AI_Filter` is a same-resolution post-process and does not upscale. It consumes the shared Frame Guidance group. Up to four passes each keep their own history. Every pass can set Style, Intensity, Local Tone, Local Structure, Skin, Preset, and Automatic Mask. Passes 2–4 inherit a setting when that control is −1. Pass feedback blends the previous answer into the next pass. A reduced processing resolution is rounded to a multiple of 16 pixels.
+`DLSSNR_AI_Filter` redraws the window at the same size. It does not upscale. Open the effect and set these. Passes 2–4 repeat Style, Intensity, Local Tone, Local Structure, Skin, and Preset. `-1` on those copies pass 1.
 
-Feature 18 uses the direct D3D12 exports of a locally supplied `nvngx_dlssnr.dll`; NGX Core only allocates and destroys the parameter block. The filter cannot separate UI already composited into the captured frame and may alter text/UI or produce ghosting and structural drift.
-
-| Control | Behaviour |
+| Setting | Config |
 | --- | --- |
-| Detail Reuse | Alternate frames skip the model. Saved detail moves with optical-flow motion, and gaps are filled from nearby detail so the reused frame does not flash back to the raw picture. |
-| ViT Reuse | `2` drops the ViT bottleneck on alternate frames. `1` computes it every frame. |
-| NVFP4 Hybrid | On RTX 50, replaces the eight FFN blocks with NVFP4. The other operators stay FP8. The files live in `DLSSNR-Hybrid` beside `Magpie.exe`. A source build that is missing that folder can fetch it with `tools/get_dlssnr_hybrid_assets.ps1`. |
+| Processing Resolution | 25–100. Default 100 |
+| Style | 0 Default, 1 Natural, 2 Cinematic |
+| Intensity | 0 off, 1 normal, 2 strong. Default 1 |
+| Local Tone | 0 off, 1 normal, 2 strong. Default 1 |
+| Local Structure | 0 soft, 1 normal, 2 sharp. Default 1 |
+| Skin | −1 follow Local Structure, 0 off, 2 strong. Default −1 |
+| Preset | 0–3. Default 0 |
+| Automatic Mask | 0 off, 1 on. Default 0 |
+| Passes | 1–4. Default 1 |
+| Feedback | 0 blend the last pass in, 1 use it whole. Default 1 |
+| Detail Reuse | 0 off, 1 every other frame. Default 0 |
+| ViT Reuse | 1 every frame, 2 every other frame. Default 1 |
+| NVFP4 Hybrid | 0 off, 1 on. RTX 50. Default 0. Turn it on only when `DLSSNR-Hybrid` is beside `Magpie.exe` |
+| Frame Guidance | 0 available, 1 off, 2 motion only, 3 depth only. Default 0 |
+| Depth Interval | 1–8 frames. Default 4 |
+
+It can still change text and UI that are already in the picture, and it can ghost on motion.
 
 #### HDR capture and present
 

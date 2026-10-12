@@ -72,15 +72,27 @@ Fork 维护者使用 OpenAI Codex 辅助开发和测试了以下基于捕获帧�
 
 #### DLSSNR AI 滤镜
 
-`DLSSNR_AI_Filter` 是同分辨率后处理，不承担放大，并复用 Frame Guidance。最多四次处理各自保留历史。每一次都可以设置 Style、Intensity、Local Tone、Local Structure、Skin、Preset 和 Automatic Mask。第 2–4 次在对应控件为 −1 时继承第一次的设置。Pass feedback 把上一次的结果混进下一次。降低处理分辨率时，工作尺寸会取整到 16 像素的倍数。
+`DLSSNR_AI_Filter` 按原尺寸重画窗口，不放大。打开效果后按下表设置。第 2–4 次会再出现 Style、Intensity、Local Tone、Local Structure、Skin 和 Preset。这些项设为 `-1` 就是沿用第 1 次。
 
-Feature 18 直接调用本地提供的 `nvngx_dlssnr.dll` 的 D3D12 导出；NGX Core 只负责参数块的分配与销毁。它无法分离已经合成到画面中的 UI，仍可能改变文字/UI，并在动态画面产生拖影或结构漂移。
-
-| 控件 | 行为 |
+| 设置 | 配置 |
 | --- | --- |
-| Detail Reuse | 隔帧跳过模型。保存的细节按光流运动到新画面上，缺口用邻近的可信细节补上，避免复用帧闪回原始画面。 |
-| ViT Reuse | 设为 `2` 时隔帧跳过 ViT 瓶颈。设为 `1` 时每帧都计算。 |
-| NVFP4 Hybrid | 在 RTX 50 上把八个 FFN 块换成 NVFP4，其余算子保持 FP8。文件放在 `Magpie.exe` 旁边的 `DLSSNR-Hybrid`。源码构建如果缺少该文件夹，可运行 `tools/get_dlssnr_hybrid_assets.ps1`。 |
+| Processing Resolution | 25–100。默认 100 |
+| Style | 0 默认，1 自然，2 电影 |
+| Intensity | 0 关，1 正常，2 强。默认 1 |
+| Local Tone | 0 关，1 正常，2 强。默认 1 |
+| Local Structure | 0 柔，1 正常，2 锐。默认 1 |
+| Skin | −1 跟随 Local Structure，0 关，2 强。默认 −1 |
+| Preset | 0–3。默认 0 |
+| Automatic Mask | 0 关，1 开。默认 0 |
+| Passes | 1–4。默认 1 |
+| Feedback | 0 混入上一次，1 完整使用上一次。默认 1 |
+| Detail Reuse | 0 关，1 隔帧。默认 0 |
+| ViT Reuse | 1 每帧，2 隔帧。默认 1 |
+| NVFP4 Hybrid | 0 关，1 开。仅 RTX 50。默认 0。`DLSSNR-Hybrid` 在 `Magpie.exe` 旁边时再打开 |
+| Frame Guidance | 0 可用，1 关，2 仅运动，3 仅深度。默认 0 |
+| Depth Interval | 1–8 帧。默认 4 |
+
+已经画在画面里的文字和 UI 仍可能被改掉，运动时也可能拖影。
 
 #### HDR 捕获与呈现
 
